@@ -30,9 +30,11 @@ pub struct Sink {
 pub struct SinkError(pub String);
 
 impl Sink {
-    /// 建立连接池并对连接执行 `SET time_zone`。
+    /// 建立连接池，并对**每个**连接执行 `SET time_zone`。
     ///
-    /// 时区必须与程序采集时间、保留期清理基准一致，故在此统一设置。
+    /// 时区必须与程序采集时间、保留期清理基准一致，故用连接池的 `after_connect`
+    /// 回调在每个连接建立时统一设置（仅 set 一次连接不够：池中其它连接不会被设置，
+    /// 会影响 `run_retention` 里 `NOW()` 的时区基准）。
     pub async fn connect(cfg: &Config) -> Result<Self, SinkError> {
         let url = format!(
             "mysql://{}:{}@{}:{}/{}",
@@ -42,16 +44,19 @@ impl Sink {
             cfg.database.port,
             cfg.database.database
         );
+        let tz_sql = schema::set_timezone_sql(&cfg.timezone);
         let pool = MySqlPoolOptions::new()
             .max_connections(cfg.database.max_connections)
+            .after_connect(move |conn, _meta| {
+                // 每个新连接建立时执行 SET time_zone（捕获 tz_sql 的克隆）。
+                let sql = tz_sql.clone();
+                Box::pin(async move {
+                    sqlx::query(&sql).execute(conn).await.map(|_| ())
+                })
+            })
             .connect(&url)
             .await
             .map_err(|e| SinkError(format!("连接 MySQL 失败: {}", e)))?;
-        // 连接级时区（影响 NOW() 与写入的 DATETIME 解释）。
-        sqlx::query(&schema::set_timezone_sql(&cfg.timezone))
-            .execute(&pool)
-            .await
-            .map_err(|e| SinkError(format!("SET time_zone 失败: {}", e)))?;
         Ok(Self {
             pool,
             table: cfg.database.table.clone(),
