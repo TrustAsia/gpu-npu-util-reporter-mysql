@@ -156,26 +156,31 @@ fn is_numeric_type(col_type: &str) -> bool {
 
 /// 把一个采集行与所有资产索引 join，补 mapping 列到 `row.strings`。
 ///
-/// - `src_key` 是行内用于关联的列名（如 namespace）。
-/// - `indices` 与 `mapping_sources` 须按相同顺序一一对应。
+/// 每个资产索引用其对应 `mapping_sources[idx].src_key` 作为行内关联键
+/// （不同资产源可用不同行内键，如一个 join namespace、另一个 join ip）。
+/// `indices` 与 `mapping_sources` 须按相同顺序一一对应。
 ///
 /// 返回 warnings 列表（当前主要是"数值类型解析失败"提示），由调用方记 WARN。
 /// 无匹配的列直接置 NULL，不产生 warning（属于正常情况）。
 pub fn join_row(
     row: &mut CollectorRow,
-    src_key: &str,
     indices: &[AssetIndex],
     mapping_sources: &[MappingSource],
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let key_value = row
-        .strings
-        .get(src_key)
-        .cloned()
-        .flatten()
-        .unwrap_or_default();
 
     for (idx, index) in indices.iter().enumerate() {
+        // 每个资产源用自己的 src_key 从行内取关联值。
+        let src_key = mapping_sources
+            .get(idx)
+            .map(|ms| ms.src_key.as_str())
+            .unwrap_or("");
+        let key_value = row
+            .strings
+            .get(src_key)
+            .cloned()
+            .flatten()
+            .unwrap_or_default();
         let matched = index.lookup(&key_value);
         for col_name in index.column_names() {
             // 查该列配置的类型，判断是否需数值解析。
@@ -283,7 +288,7 @@ mod tests {
             strings: HashMap::from([("namespace".into(), Some("default".into()))]),
             source: "s1".into(),
         };
-        let warnings = join_row(&mut row, "namespace", &indices, &cfg.sources);
+        let warnings = join_row(&mut row, &indices, &cfg.sources);
         assert!(warnings.is_empty());
         assert_eq!(row.strings.get("location").unwrap().as_deref(), Some("机房A"));
     }
@@ -304,7 +309,7 @@ mod tests {
             strings: HashMap::from([("namespace".into(), Some("zzz".into()))]),
             source: "s1".into(),
         };
-        join_row(&mut row, "namespace", &indices, &cfg.sources);
+        join_row(&mut row, &indices, &cfg.sources);
         assert_eq!(row.strings.get("location").unwrap(), &None);
     }
 
@@ -340,7 +345,7 @@ mod tests {
             strings: HashMap::from([("namespace".into(), Some("default".into()))]),
             source: "s1".into(),
         };
-        let warnings = join_row(&mut row, "namespace", &indices, &cfg.sources);
+        let warnings = join_row(&mut row, &indices, &cfg.sources);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("loc_int"));
         assert_eq!(row.strings.get("loc_int").unwrap(), &None);

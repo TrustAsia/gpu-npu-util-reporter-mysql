@@ -19,10 +19,13 @@ pub enum SchemaCheck {
 /// 对比期望列与实际列。
 ///
 /// 期望列来自配置（固定列 + mapping 列）。缺列优先于多列返回
-/// （缺列是必须修复的硬错误）。
+/// （缺列是必须修复的硬错误）。返回的列名已排序，使错误信息可复现
+/// （`HashSet` 迭代序不确定，否则同一问题两次运行列序可能不同）。
 pub fn compare(expected: &HashSet<String>, actual: &HashSet<String>) -> SchemaCheck {
-    let missing: Vec<String> = expected.difference(actual).cloned().collect();
-    let extra: Vec<String> = actual.difference(expected).cloned().collect();
+    let mut missing: Vec<String> = expected.difference(actual).cloned().collect();
+    missing.sort();
+    let mut extra: Vec<String> = actual.difference(expected).cloned().collect();
+    extra.sort();
     if !missing.is_empty() {
         SchemaCheck::Missing(missing)
     } else if !extra.is_empty() {
@@ -46,9 +49,14 @@ pub fn retention_delete_sql(table: &str) -> String {
 }
 
 /// 读取表列的 SQL（查 INFORMATION_SCHEMA）。
+///
+/// **必须限定 TABLE_SCHEMA**：仅按 TABLE_NAME 过滤会匹配服务器上所有库的同名表，
+/// 返回的列是跨库并集，可能掩盖真正的缺列（另一库恰好有同名列）或制造虚假多列，
+/// 使 schema 校验（缺列即退出的硬门槛）失效。`DATABASE()` 解析为当前连接库
+/// （URL 里指定的 database），精确限定到目标库。
 pub fn list_columns_sql(table: &str) -> String {
     format!(
-        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}'",
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
         table
     )
 }
@@ -95,6 +103,9 @@ mod tests {
     fn sql_builders_format() {
         assert_eq!(set_timezone_sql("Asia/Shanghai"), "SET time_zone = 'Asia/Shanghai'");
         assert_eq!(retention_delete_sql("gpu_usage"), "DELETE FROM gpu_usage WHERE ts < DATE_SUB(NOW(), INTERVAL ? DAY)");
-        assert!(list_columns_sql("t").contains("TABLE_NAME = 't'"));
+        // 必须限定 TABLE_SCHEMA，否则跨库同名表会污染列集合。
+        let cols_sql = list_columns_sql("t");
+        assert!(cols_sql.contains("TABLE_SCHEMA = DATABASE()"), "缺 TABLE_SCHEMA 限定: {}", cols_sql);
+        assert!(cols_sql.contains("TABLE_NAME = 't'"));
     }
 }

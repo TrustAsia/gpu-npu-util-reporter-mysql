@@ -211,7 +211,7 @@ async fn mapping_join_after_collect() {
 
     rows.sort_by(|a, b| a.card_id.cmp(&b.card_id));
     for row in rows.iter_mut() {
-        let warnings = join_row(row, "namespace", &index, &msrcs);
+        let warnings = join_row(row, &index, &msrcs);
         assert!(warnings.is_empty(), "不应有 warning: {:?}", warnings);
     }
 
@@ -221,6 +221,54 @@ async fn mapping_join_after_collect() {
     // 卡1 namespace=zzz-no-match → 无匹配置 NULL。
     assert_eq!(rows[1].strings.get("location").unwrap(), &None);
     assert_eq!(rows[1].strings.get("owner").unwrap(), &None);
+}
+
+/// 验证 mapping 各资产源用自己的 src_key（issue #3 回归守护）：
+/// 构造一个 src_key=ip 的资产源，行内按 ip 关联，确认 join_row 用 ip 而非 namespace。
+#[test]
+fn mapping_join_uses_per_source_src_key() {
+    // 行内：ip=10.0.0.1。资产源声明 src_key=ip。
+    let ms = gpu_npu_util_reporter::config::MappingSource {
+        source_path: "tests/fixtures/assets.csv".into(),
+        src_key: "ip".into(), // 故意用 ip 而非 namespace，验证按源取键
+        dest_key: "Namespace".into(),
+        source_sheet: None,
+        columns: vec![gpu_npu_util_reporter::config::MappingColumn {
+            source_field: "机房位置".into(),
+            rename: Some("location".into()),
+            col_type: "varchar(255)".into(),
+            comment: "机房".into(),
+            position: gpu_npu_util_reporter::config::ColumnPosition {
+                direction: "after".into(),
+                anchor: "namespace".into(),
+            },
+        }],
+    };
+    let index = vec![gpu_npu_util_reporter::mapping::load_source(&ms).unwrap()];
+    let msrcs = vec![ms];
+
+    // 行内同时有 namespace(default) 和 ip；但本源 src_key=ip，故应按 ip 关联。
+    // assets.csv 的 dest_key 是 Namespace 列，值不可能是 IP → 必然无匹配 → NULL。
+    let mut row = gpu_npu_util_reporter::models::Row {
+        ts: chrono::Utc::now().with_timezone(&chrono_tz::Asia::Shanghai),
+        ip: "10.0.0.1".into(),
+        card_id: "0".into(),
+        fields: Default::default(),
+        strings: HashMap::from([
+            ("namespace".into(), Some("default".into())),
+            ("ip".into(), Some("10.0.0.1".into())),
+        ]),
+        source: "s1".into(),
+    };
+    let warnings = join_row(&mut row, &index, &msrcs);
+    assert!(warnings.is_empty());
+    // src_key=ip，而资产表无 IP 值的 Namespace 列 → 无匹配 → location 应为 NULL。
+    // 若错误地用 namespace 关联，则会命中 default → location=机房A（本测试即排除该 bug）。
+    assert_eq!(
+        row.strings.get("location").unwrap(),
+        &None,
+        "join_row 应按 src_key=ip 关联，而非 namespace"
+    );
 }
 
 /// 守护：配置示例 config.example.yaml 能完整解析 + 校验（防止文档与代码漂移）。

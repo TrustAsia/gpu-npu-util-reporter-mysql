@@ -162,8 +162,8 @@ async fn main() {
     } else {
         Arc::new(Vec::new())
     };
-    // 行内关联键：取首个 mapping source 的 src_key（多 source 共用一个 key 的简化）。
-    let mapping_src_key = cfg.mapping.sources.first().map(|m| m.src_key.clone());
+    // 资产源配置：join_row 内部按各 mapping_sources[i].src_key 取行内关联值，
+    // 故不同资产源可用不同行内键（如一个 join namespace、另一个 join ip）。
     let mapping_sources = Arc::new(cfg.mapping.sources.clone());
 
     // 启动采集调度（含每源采集任务 + 保留期清理任务）。
@@ -172,36 +172,58 @@ async fn main() {
         source::PrometheusClient::new(url, timeout)
             .unwrap_or_else(|e| panic!("构建 HTTP 客户端失败 ({}): {}", url, e.0))
     };
+    // 优雅退出信号：置位后各任务在下一轮开始前退出（当前轮已完整写入）。
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handles = scheduler::run(
         cfg_arc.clone(),
         sink.clone(),
         client_factory,
         asset_indices,
         mapping_sources,
-        mapping_src_key,
+        shutdown.clone(),
     );
 
     // 启动日志归档后台任务。
     let log_cfg = cfg_arc.logging.clone();
-    let log_handle = tokio::spawn(log_archive::run_loop(
-        PathBuf::from(&log_cfg.dir),
-        log_cfg.archive_after_days,
-        3600, // 归档扫描间隔（秒）
-        log_cfg.archive_prefix.clone(),
-        log_cfg.all_file.clone(),
-        log_cfg.error_file.clone(),
-        tz,
-    ));
+    let shutdown_for_log = shutdown.clone();
+    let log_handle = tokio::spawn(async move {
+        log_archive::run_loop(
+            PathBuf::from(&log_cfg.dir),
+            log_cfg.archive_after_days,
+            3600, // 归档扫描间隔（秒）
+            log_cfg.archive_prefix.clone(),
+            log_cfg.all_file.clone(),
+            log_cfg.error_file.clone(),
+            tz,
+            shutdown_for_log,
+        )
+        .await;
+    });
 
-    // 优雅退出：等待 Ctrl+C。
-    tracing::info!("已启动所有采集与维护任务，等待 Ctrl+C 退出");
-    tokio::signal::ctrl_c().await.ok();
-    tracing::info!("收到退出信号，正在停止任务...");
+    // 优雅退出：捕获 SIGINT(Ctrl+C) 或 SIGTERM(容器停止)，等当前轮完成再退出。
+    // SIGTERM 是 Kubernetes/Docker 停止容器的信号，必须处理（spec §9）。
+    tracing::info!("已启动所有采集与维护任务，等待 SIGINT/SIGTERM 退出");
+    wait_for_shutdown_signal().await;
+    tracing::info!("收到退出信号，等待当前轮采集/写入完成...");
+    shutdown.store(true, std::sync::atomic::Ordering::Release);
+    // 等待各任务在轮次边界自行退出（而非 abort 打断写入）。
     for h in handles {
-        h.abort();
+        // 等待结果，忽略 JoinError（任务已正常返回）。
+        let _ = h.await;
     }
     log_handle.abort();
-    tracing::info!("已停止，退出");
+    tracing::info!("已优雅退出");
+}
+
+/// 等待 SIGINT 或 SIGTERM（二者任一到达即返回）。
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("注册 SIGINT 失败");
+    let mut sigterm = signal(SignalKind::terminate()).expect("注册 SIGTERM 失败");
+    tokio::select! {
+        _ = sigint.recv() => tracing::info!("收到 SIGINT"),
+        _ = sigterm.recv() => tracing::info!("收到 SIGTERM"),
+    }
 }
 
 // =====================================================================
@@ -220,54 +242,68 @@ fn daily_log_path(dir: &str, base: &str, tz: chrono_tz::Tz) -> PathBuf {
     PathBuf::from(dir).join(format!("{}-{}.log", stem, today.format("%Y-%m-%d")))
 }
 
-/// 一个按日切分、可写 all 与 error 两文件(按级别)的 MakeWriter。
+/// 按日期缓存复用的追加写文件句柄。
 ///
-/// 每次 make_writer 用一个按当前日期算路径的 writer；为避免持有过多句柄，
-/// 这里用 `Box<dyn Write>` 让 tracing 接管生命周期。
-struct DailyFileWriter {
+/// 同一天内复用同一 `Arc<Mutex<File>>`，跨天（日期变化）时重新打开新文件，
+/// 旧句柄随缓存替换被 drop（关闭）。避免每条日志都 open/close 系统调用。
+struct CachedAppendFile {
     dir: String,
-    all_base: String,
-    err_base: String,
+    base: String,
     tz: chrono_tz::Tz,
-    /// 已确认目录存在的标记，避免每条日志都 stat。
-    dir_ready: Arc<Mutex<bool>>,
+    /// (日期, 句柄)；日期变了就重开。
+    cached: Mutex<Option<(chrono::NaiveDate, Arc<Mutex<std::fs::File>>)>>,
 }
 
-impl<'a> MakeWriter<'a> for DailyFileWriter {
-    // 用 Box 让 tracing 在自己的缓冲生命周期里持有 writer。
-    // 注意：这里不能加 'a 约束（Writer 须 owned/Send），故返回独立分配的 writer。
-    type Writer = Box<dyn Write + Send + 'a>;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.ensure_dir();
-        let all = daily_log_path(&self.dir, &self.all_base, self.tz);
-        match AppendWriter::open(&all) {
-            Ok(a) => Box::new(TeeWriter::new(a, None::<AppendWriter>)),
-            Err(_) => Box::new(io::sink()),
+impl CachedAppendFile {
+    fn new(dir: String, base: String, tz: chrono_tz::Tz) -> Self {
+        Self {
+            dir,
+            base,
+            tz,
+            cached: Mutex::new(None),
         }
     }
 
-    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
-        self.ensure_dir();
-        let all = daily_log_path(&self.dir, &self.all_base, self.tz);
-        let err = daily_log_path(&self.dir, &self.err_base, self.tz);
-        // 完整文件始终写；错误文件仅 ERROR 写。
-        let all_w = AppendWriter::open(&all);
-        let err_w = if *meta.level() == tracing::Level::ERROR {
-            AppendWriter::open(&err)
-        } else {
-            Err(io::Error::other("not error level"))
+    /// 返回当前日期对应文件句柄的 Arc 克隆（必要时重开）。
+    /// 文件打不开时返回 None（调用方退化为丢弃日志，避免日志拖垮采集）。
+    fn handle(&self) -> Option<Arc<Mutex<std::fs::File>>> {
+        let today = chrono::Utc::now().with_timezone(&self.tz).date_naive();
+        let mut slot = self.cached.lock().unwrap();
+        let needs_open = match slot.as_ref() {
+            None => true,
+            Some((d, _)) => *d != today,
         };
-        match (all_w, err_w) {
-            (Ok(a), Ok(e)) => Box::new(TeeWriter::new(a, Some(e))),
-            (Ok(a), Err(_)) => Box::new(TeeWriter::new(a, None::<AppendWriter>)),
-            // 主文件都打不开时退化为丢弃（不 panic，避免日志拖垮采集）。
-            (Err(_), _) => Box::new(io::sink()),
+        if needs_open {
+            let path = daily_log_path(&self.dir, &self.base, self.tz);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => *slot = Some((today, Arc::new(Mutex::new(f)))),
+                Err(_) => return None,
+            }
         }
+        slot.as_ref().map(|(_, h)| h.clone())
     }
+}
+
+/// 一个按日切分、可写 all 与 error 两文件(按级别)的 MakeWriter。
+///
+/// 文件句柄按日期缓存复用（同一天内复用，跨天重开）。`make_writer_for` 按
+/// metadata 级别决定是否同时写 error 文件。
+struct DailyFileWriter {
+    dir: String,
+    /// 已确认目录存在的标记，避免每条日志都 stat。
+    dir_ready: Mutex<bool>,
+    /// all 文件缓存句柄。
+    all_file: CachedAppendFile,
+    /// error 文件缓存句柄。
+    err_file: CachedAppendFile,
 }
 
 impl DailyFileWriter {
+    /// 确保日志目录存在（惰性创建一次）。
     fn ensure_dir(&self) {
         let mut ready = self.dir_ready.lock().unwrap();
         if *ready {
@@ -278,56 +314,64 @@ impl DailyFileWriter {
     }
 }
 
-/// 以 append 方式打开文件（不存在则创建）。
-struct AppendWriter(std::fs::File);
+impl<'a> MakeWriter<'a> for DailyFileWriter {
+    type Writer = Box<dyn Write + Send + 'a>;
 
-impl AppendWriter {
-    fn open(path: &PathBuf) -> io::Result<Self> {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self(f))
+    fn make_writer(&'a self) -> Self::Writer {
+        self.ensure_dir();
+        match self.all_file.handle() {
+            Some(a) => Box::new(TeeWriter::new(a, None)),
+            None => Box::new(io::sink()),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        self.ensure_dir();
+        let all = self.all_file.handle();
+        let err = if *meta.level() == tracing::Level::ERROR {
+            self.err_file.handle()
+        } else {
+            None
+        };
+        match (all, err) {
+            (Some(a), Some(e)) => Box::new(TeeWriter::new(a, Some(e))),
+            (Some(a), None) => Box::new(TeeWriter::new(a, None)),
+            // 主文件都打不开时退化为丢弃（不 panic，避免日志拖垮采集）。
+            (None, _) => Box::new(io::sink()),
+        }
     }
 }
 
-impl Write for AppendWriter {
+/// 把输出同时写到 all 与(可选的)error 文件（均为 Arc<Mutex<File>> 句柄）。
+/// 写时短暂加锁；error 文件写失败不阻塞主文件。
+struct TeeWriter {
+    all: Arc<Mutex<std::fs::File>>,
+    err: Option<Arc<Mutex<std::fs::File>>>,
+}
+
+impl TeeWriter {
+    fn new(all: Arc<Mutex<std::fs::File>>, err: Option<Arc<Mutex<std::fs::File>>>) -> Self {
+        Self { all, err }
+    }
+}
+
+impl Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-
-/// 把输出同时写到 all 与(可选的)error 文件。
-struct TeeWriter<A: Write, B: Write> {
-    a: A,
-    b: Option<B>,
-}
-
-impl<A: Write, B: Write> TeeWriter<A, B> {
-    fn new(a: A, b: Option<B>) -> Self {
-        Self { a, b }
-    }
-}
-
-impl<A: Write, B: Write> Write for TeeWriter<A, B> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.a.write(buf)?;
-        if let Some(b) = self.b.as_mut() {
-            let _ = b.write_all(buf); // error 文件写失败不阻塞主文件
+        let n = self.all.lock().unwrap().write(buf)?;
+        if let Some(e) = self.err.as_ref() {
+            let _ = e.lock().unwrap().write_all(buf);
         }
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.a.flush()?;
-        if let Some(b) = self.b.as_mut() {
-            let _ = b.flush();
+        self.all.lock().unwrap().flush()?;
+        if let Some(e) = self.err.as_ref() {
+            let _ = e.lock().unwrap().flush();
         }
         Ok(())
     }
 }
+
 
 /// 初始化 tracing：stdout(可选) + 双文件(all INFO+ / error ERROR)，按级别过滤。
 fn init_logging(cfg: &config::Config, tz: chrono_tz::Tz) {
@@ -336,10 +380,17 @@ fn init_logging(cfg: &config::Config, tz: chrono_tz::Tz) {
 
     let file_writer = DailyFileWriter {
         dir: cfg.logging.dir.clone(),
-        all_base: cfg.logging.all_file.clone(),
-        err_base: cfg.logging.error_file.clone(),
-        tz,
-        dir_ready: Arc::new(Mutex::new(false)),
+        dir_ready: Mutex::new(false),
+        all_file: CachedAppendFile::new(
+            cfg.logging.dir.clone(),
+            cfg.logging.all_file.clone(),
+            tz,
+        ),
+        err_file: CachedAppendFile::new(
+            cfg.logging.dir.clone(),
+            cfg.logging.error_file.clone(),
+            tz,
+        ),
     };
 
     // 级别过滤：解析为 LevelFilter（订阅层共用，决定哪些事件进入写入层）。
@@ -377,8 +428,8 @@ fn init_logging(cfg: &config::Config, tz: chrono_tz::Tz) {
 
 /// 判断标准输出是否为 TTY（决定是否着色、ask 模式是否交互）。
 fn is_tty() -> bool {
-    // libc::isatty(1)：1 = stdout。避免引入额外 isatty 依赖。
-    unsafe { libc::isatty(1) == 1 }
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
 }
 
 /// TTY 交互：询问用户表多列时是否继续。

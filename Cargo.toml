@@ -5,7 +5,7 @@
 # =====================================================================
 [package]
 name = "gpu-npu-util-reporter"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "定时从多个 Prometheus 服务器读取 GPU/NPU 及主机指标，按卡片维度对齐后写入 MySQL"
 
@@ -40,8 +40,6 @@ thiserror = "1"
 regex = "1"
 # async trait：为 extractor 抽象可 mock 的查询接口
 async-trait = "0.1"
-# TTY 检测(isatty)，用于日志着色开关与 on_extra_columns=ask 交互判断
-libc = "0.2"
 
 [dev-dependencies]
 # 测试用 tokio 工具（test-util 提供 pause/advance 时间控制）

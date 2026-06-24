@@ -283,37 +283,3 @@ sources:
         assert!(sql.contains("    INDEX idx_ts (ts)\n) ENGINE=InnoDB"));
     }
 }
-
-#[cfg(test)]
-mod dump {
-    #[test]
-    fn print_it() {
-        let yaml = r#"
-interval: 60
-retention_days: 30
-retention_interval: 3600
-timezone: "Asia/Shanghai"
-database: { host: "h", port: 3306, user: "u", password: "p", database: "db", table: "gpu_usage", max_connections: 10 }
-logging: { level: "info", dir: "./logs", all_file: "all.log", error_file: "error.log", rotation: "daily", archive_after_days: 7, archive_prefix: "logs", stdout: true }
-mapping:
-  enabled: true
-  sources:
-    - source_path: "./a.csv"
-      src_key: "namespace"
-      dest_key: "Namespace"
-      columns:
-        - source_field: "x"
-          rename: "location"
-          type: "varchar(255)"
-          comment: "loc"
-          position: { direction: after, anchor: "namespace" }
-sources:
-  - name: "s1"
-    ip: "1.1.1.1"
-    url: "http://1.1.1.1:9090"
-    primary: { metric: "m1", card_label: "gpu" }
-"#;
-        let cfg: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
-        println!("===SQL===\n{}===END===", super::generate(&cfg));
-    }
-}

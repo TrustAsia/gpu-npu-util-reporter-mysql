@@ -16,6 +16,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::time::Duration;
 
 /// 归档错误（携带可读描述）。
@@ -122,6 +123,7 @@ fn create_tar_gz(out: &Path, files: &[(&str, &PathBuf)]) -> Result<(), ArchiveEr
 /// 后台循环：每 `interval` 秒扫描归档一次。
 ///
 /// `tz` 为配置时区，用于算"今天"基准。失败只记日志，不退出循环。
+/// `shutdown` 置位时在下次循环开始前退出（与采集任务同模式优雅退出）。
 pub async fn run_loop(
     dir: PathBuf,
     archive_after_days: u32,
@@ -130,15 +132,29 @@ pub async fn run_loop(
     all_file: String,
     error_file: String,
     tz: chrono_tz::Tz,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering;
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         let today = chrono::Utc::now().with_timezone(&tz).date_naive();
         if let Err(e) =
             archive_old_logs(&dir, archive_after_days, today, &prefix, &all_file, &error_file)
         {
             tracing::error!(target: "log_archive", "归档失败: {}", e.0);
         }
-        tokio::time::sleep(Duration::from_secs(interval)).await;
+        // 分片睡眠以及时响应退出信号。
+        let mut remaining = interval;
+        while remaining > 0 {
+            let step = remaining.min(1);
+            tokio::time::sleep(Duration::from_secs(step)).await;
+            remaining -= step;
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+        }
     }
 }
 

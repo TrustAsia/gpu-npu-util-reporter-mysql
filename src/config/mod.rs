@@ -273,9 +273,23 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 
 /// 校验配置。失败返回 [`ConfigError`]，调用方应据此退出。
 pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
-    // 采集间隔必须为正，否则调度会忙循环空转。
+    // 所有调度间隔必须为正，否则对应任务会忙循环空转压垮 Prometheus/MySQL。
+    // 全局 interval、保留期清理 interval、每个 source 自身 interval 均覆盖。
     if cfg.interval == 0 {
         return Err(ConfigError("interval 必须 > 0".into()));
+    }
+    if cfg.retention_interval == 0 {
+        return Err(ConfigError("retention_interval 必须 > 0".into()));
+    }
+    for (i, src) in cfg.sources.iter().enumerate() {
+        if let Some(iv) = src.interval {
+            if iv == 0 {
+                return Err(ConfigError(format!(
+                    "sources[{}]({}).interval 必须 > 0",
+                    i, src.name
+                )));
+            }
+        }
     }
     // 至少要有一个数据源，否则程序空跑。
     if cfg.sources.is_empty() {
@@ -473,6 +487,35 @@ sources:
         let yaml = valid_base_yaml().replace("interval: 60", "interval: 0");
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_retention_interval() {
+        let yaml = valid_base_yaml().replace("retention_interval: 3600", "retention_interval: 0");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_source_interval() {
+        // 给 source 加一个 interval: 0，应被拒绝。
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "interval: 0\n    primary: { metric: \"m1\", card_label: \"gpu\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn accepts_positive_source_interval() {
+        // source 自身正数 interval 应通过。
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "interval: 30\n    primary: { metric: \"m1\", card_label: \"gpu\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]

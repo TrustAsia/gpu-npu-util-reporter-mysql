@@ -18,6 +18,7 @@
 use crate::extractor::{collect_source, SourceQuerier};
 use crate::mapping::{join_row, AssetIndex};
 use crate::sink::Sink;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -28,20 +29,44 @@ pub fn effective_interval(src_interval: Option<u64>, global_interval: u64) -> u6
     src_interval.unwrap_or(global_interval)
 }
 
-/// 启动所有 source 的采集任务 + 保留期清理任务，返回各任务 `JoinHandle`，
-/// 交由 main 统一管理生命周期（优雅退出时 abort）。
+/// 在循环间隙睡眠 `secs`，但若收到 `shutdown` 信号则提前返回 `false`。
+/// 用于优雅退出：不在采集轮次中途打断，而在两轮之间的 sleep 处响应退出。
+async fn sleep_or_shutdown(secs: u64, shutdown: &AtomicBool) -> bool {
+    if shutdown.load(Ordering::Acquire) {
+        return false;
+    }
+    // 分片睡眠（每秒检查一次信号），避免长间隔时退出延迟过大。
+    let mut remaining = secs;
+    while remaining > 0 {
+        let step = remaining.min(1);
+        tokio::time::sleep(Duration::from_secs(step)).await;
+        remaining -= step;
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 启动所有 source 的采集任务 + 保留期清理任务，返回各任务 `JoinHandle`。
+///
+/// `shutdown` 为优雅退出信号：main 收到 SIGINT/SIGTERM 后置位，各任务在
+/// **下一轮循环开始前**（当前轮的 collect+insert 已完成）检查并退出，
+/// 避免 abort 打断正在写入的批次（spec §9：等当前轮完成再退出）。
+/// 故调用方应：置位 `shutdown` → `await` 各 handle（而非 `abort`）。
 ///
 /// `client_factory` 接收 `(url, timeout)`，每调用一次为对应 source 创建一个
 /// 实现了 [`SourceQuerier`] 的客户端。
 ///
-/// `mapping_src_key` 为行内关联键列名（如 `namespace`）；`None` 表示不启用 mapping。
+/// `asset_indices` 为空时跳过 mapping join；非空时 `join_row` 用各
+/// `mapping_sources[i].src_key` 取行内关联值，支持不同资产源用不同行内键。
 pub fn run<Q>(
     cfg: Arc<crate::config::Config>,
     sink: Arc<Sink>,
     client_factory: impl Fn(&str, u64) -> Q,
     asset_indices: Arc<Vec<AssetIndex>>,
     mapping_sources: Arc<Vec<crate::config::MappingSource>>,
-    mapping_src_key: Option<String>,
+    shutdown: Arc<AtomicBool>,
 ) -> Vec<tokio::task::JoinHandle<()>>
 where
     Q: SourceQuerier + Send + Sync + 'static,
@@ -63,6 +88,7 @@ where
         let sink2 = sink.clone();
         let days = cfg.retention_days;
         let interval = cfg.retention_interval;
+        let shutdown2 = shutdown.clone();
         handles.push(tokio::spawn(async move {
             loop {
                 match sink2.run_retention(days).await {
@@ -72,7 +98,9 @@ where
                     Ok(_) => {}
                     Err(e) => tracing::error!(target: "retention", "保留期清理失败: {}", e.0),
                 }
-                tokio::time::sleep(Duration::from_secs(interval)).await;
+                if !sleep_or_shutdown(interval, &shutdown2).await {
+                    break;
+                }
             }
         }));
     }
@@ -87,21 +115,25 @@ where
         let src_cfg = Arc::new(src.clone());
         let indices = asset_indices.clone();
         let msrcs = mapping_sources.clone();
-        let msk = mapping_src_key.clone();
         let mapping_cols = mapping_cols.clone();
+        let shutdown2 = shutdown.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
+                // 退出信号在轮次开始前检查：确保上一轮已完整写入。
+                if shutdown2.load(Ordering::Acquire) {
+                    break;
+                }
                 let started = std::time::Instant::now();
                 match collect_source(&src_cfg, &client, tz).await {
                     Ok(mut rows) => {
                         // mapping join（仅当配置启用且有资产索引）。
-                        if let Some(key) = msk.as_ref() {
-                            if !indices.is_empty() {
-                                for row in rows.iter_mut() {
-                                    for w in join_row(row, key, &indices, &msrcs) {
-                                        tracing::warn!(source = %name, "mapping: {}", w);
-                                    }
+                        // join_row 内部按各 mapping_sources[i].src_key 取行内关联值，
+                        // 故无需外部传入单一 key，支持不同资产源用不同行内键。
+                        if !indices.is_empty() {
+                            for row in rows.iter_mut() {
+                                for w in join_row(row, &indices, &msrcs) {
+                                    tracing::warn!(source = %name, "mapping: {}", w);
                                 }
                             }
                         }
@@ -119,7 +151,9 @@ where
                         tracing::warn!(source = %name, "采集失败，跳过本轮: {}", e.0);
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(interval)).await;
+                if !sleep_or_shutdown(interval, &shutdown2).await {
+                    break;
+                }
             }
         }));
     }
@@ -139,5 +173,41 @@ mod tests {
     #[test]
     fn falls_back_to_global_when_source_unset() {
         assert_eq!(effective_interval(None, 60), 60);
+    }
+
+    /// shutdown 已置位时，sleep_or_shutdown 立即返回 false（不等满睡眠）。
+    #[tokio::test]
+    async fn sleep_returns_false_when_shutdown_set() {
+        let shutdown = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        let cont = sleep_or_shutdown(60, &shutdown).await;
+        assert!(!cont);
+        // 应几乎立即返回，不应等 60 秒。
+        assert!(started.elapsed().as_secs() < 5);
+    }
+
+    /// shutdown 未置位时，sleep_or_shutdown 睡满后返回 true。
+    #[tokio::test]
+    async fn sleep_returns_true_when_not_shutdown() {
+        let shutdown = AtomicBool::new(false);
+        let cont = sleep_or_shutdown(2, &shutdown).await;
+        assert!(cont);
+    }
+
+    /// 睡眠中途置位 shutdown，应提前返回 false（分片睡眠每秒检查一次）。
+    #[tokio::test]
+    async fn sleep_interruptible_midway() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        // 1 秒后置位。
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            s2.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let cont = sleep_or_shutdown(60, &shutdown).await;
+        assert!(!cont);
+        // 应在约 2 秒内返回（1 秒等待置位 + 一次分片检查），远小于 60。
+        assert!(started.elapsed().as_secs() < 5);
     }
 }
