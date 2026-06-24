@@ -59,6 +59,11 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
     let primary_samples = client.query(&cfg.primary.metric).await?;
     let card_label = &cfg.primary.card_label;
 
+    // 主指标为空（exporter 宕机/无卡）：提前返回，避免后续无谓的查询。
+    if primary_samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
     // 2. 批量查询用到的所有 metric（fields 来源 + expressions 变量），缓存。
     let needed_metrics = collect_needed_metrics(cfg);
     let mut metric_cache: HashMap<String, Vec<MetricSample>> = HashMap::new();
@@ -67,17 +72,41 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         metric_cache.insert(m.clone(), samples);
     }
 
+    let align_labels = vec![card_label.clone()];
+
+    // 预建索引：每个 metric 的"对齐键->值"与"对齐键->标签集"只算一次，
+    // 避免在逐卡循环里反复重建 HashMap（原本是 O(卡数×字段数×样本数)）。
+    let value_idx: HashMap<String, HashMap<String, f64>> = metric_cache
+        .iter()
+        .map(|(m, s)| (m.clone(), align::index_by_key(s, &align_labels)))
+        .collect();
+    let label_idx: HashMap<String, HashMap<String, HashMap<String, String>>> = metric_cache
+        .iter()
+        .map(|(m, s)| (m.clone(), align::index_labels_by_key(s, &align_labels)))
+        .collect();
+
     // 3. 主机级字段（整主机单值）：每个 host_field 查一次，取首条序列的值。
+    //    单个 host_field 查询失败只让该字段本轮写 NULL（WARN），不连累整个 source
+    //    （与逐卡字段缺失的软失败语义一致；否则抖动的 host_cpu 查询会丢掉全部卡数据）。
     let mut host_values: HashMap<String, f64> = HashMap::new();
     for hf in &cfg.host_fields {
-        let samples = client.query(&hf.expr).await?;
-        if let Some(first) = samples.first() {
-            host_values.insert(hf.name.clone(), first.value);
+        match client.query(&hf.expr).await {
+            Ok(samples) => {
+                if let Some(first) = samples.first() {
+                    host_values.insert(hf.name.clone(), first.value);
+                }
+                // 无结果则该字段缺席（后续填 NULL）。
+            }
+            Err(e) => {
+                tracing::warn!(
+                    field = %hf.name,
+                    error = %e.0,
+                    "host_field 查询失败，该字段本轮写 NULL"
+                );
+            }
         }
-        // 无结果则该字段缺席（后续填 NULL）。
     }
 
-    let align_labels = vec![card_label.clone()];
     let now = Utc::now().with_timezone(&tz);
 
     let mut rows = Vec::with_capacity(primary_samples.len());
@@ -94,23 +123,20 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
             source: cfg.name.clone(),
         };
 
-        // 各字段对齐
+        // 各字段对齐（用预建索引，O(1) 查找）
         for fc in &cfg.fields {
-            let samples = metric_cache.get(&fc.metric);
             match fc.from.as_str() {
                 "metric" => {
-                    let idx = samples
-                        .map(|s| align::index_by_key(s, &align_labels))
-                        .unwrap_or_default();
-                    let v = idx.get(&key).copied();
+                    let v = value_idx.get(&fc.metric).and_then(|m| m.get(&key)).copied();
                     row.fields.insert(fc.name.clone(), v);
                 }
                 "label" => {
                     let label = fc.label.as_deref().unwrap_or("");
-                    let idx = samples
-                        .map(|s| align::index_labels_by_key(s, &align_labels))
-                        .unwrap_or_default();
-                    let v = idx.get(&key).and_then(|m| m.get(label)).cloned();
+                    let v = label_idx
+                        .get(&fc.metric)
+                        .and_then(|m| m.get(&key))
+                        .and_then(|m| m.get(label))
+                        .cloned();
                     row.strings.insert(fc.name.clone(), v);
                 }
                 _ => {
@@ -119,9 +145,9 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
             }
         }
 
-        // expressions：构建变量值表（变量名=metric 名），求值。
+        // expressions：构建变量值表（变量名=metric 名，用预建索引取该卡的值），求值。
         for ec in &cfg.expressions {
-            let vars = build_vars_for_expr(&ec.expr, &key, &align_labels, &metric_cache);
+            let vars = build_vars_for_expr(&ec.expr, &key, &value_idx);
             // 用 expr::eval 一步求值，避免跨模块命名私有的 Ast。
             let val = expr::eval(&ec.expr, &vars);
             row.fields.insert(ec.name.clone(), val);
@@ -165,19 +191,17 @@ fn collect_needed_metrics(cfg: &SourceConfig) -> Vec<String> {
 }
 
 /// 为表达式构建变量值表：`变量名(metric) -> 该卡的值`。
+///
+/// 直接查预建好的 `value_idx`（对齐键->值），避免重复建索引。
 fn build_vars_for_expr(
     expr_str: &str,
     key: &str,
-    align_labels: &[String],
-    metric_cache: &HashMap<String, Vec<MetricSample>>,
+    value_idx: &HashMap<String, HashMap<String, f64>>,
 ) -> HashMap<String, f64> {
     let mut vars = HashMap::new();
     for var in extract_var_names(expr_str) {
-        if let Some(samples) = metric_cache.get(&var) {
-            let idx = align::index_by_key(samples, align_labels);
-            if let Some(v) = idx.get(key) {
-                vars.insert(var, *v);
-            }
+        if let Some(v) = value_idx.get(&var).and_then(|m| m.get(key)) {
+            vars.insert(var, *v);
         }
     }
     vars
