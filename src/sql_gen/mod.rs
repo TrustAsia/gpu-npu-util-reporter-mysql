@@ -27,9 +27,11 @@ pub fn generate(cfg: &Config) -> String {
     lines.push("-- 注意: 本文件不含 DROP TABLE，重复执行会因表已存在而跳过(IF NOT EXISTS)。".into());
     lines.push(format!("CREATE TABLE IF NOT EXISTS {} (", cfg.database.table));
 
+    // 每个列定义：缩进 + 列名 + 类型声明 + COMMENT，行尾逗号分隔。
+    // （COMMENT 前必须有空格；每行末尾逗号是 MySQL 列分隔所必需。）
     let col_lines: Vec<String> = columns
         .iter()
-        .map(|c| format!("    {:<16} {}{}", c.name, type_decl(c), comment_clause(c)))
+        .map(|c| format!("    {:<16} {} {},", c.name, type_decl(c), comment_clause(c)))
         .collect();
     lines.extend(col_lines);
 
@@ -239,5 +241,79 @@ sources:
         assert_eq!(col_type_to_sql("float"), "DOUBLE");
         assert_eq!(col_type_to_sql("varchar(255)"), "varchar(255)");
         assert_eq!(col_type_to_sql("text"), "text");
+    }
+
+    /// 回归：生成的 DDL 必须是语法合法的 MySQL。
+    /// 此前出现过两处缺陷：(1) 列间无逗号；(2) 类型与 COMMENT 间无空格。
+    /// 这里用结构化断言锁定。
+    #[test]
+    fn generated_ddl_is_well_formed() {
+        let cfg = cfg_with_mapping();
+        let sql = generate(&cfg);
+        // 数据列行：以 4 空格缩进开头且含 COMMENT（排除 PRIMARY KEY/INDEX 行）。
+        let body: Vec<&str> = sql
+            .lines()
+            .filter(|l| l.starts_with("    ") && l.contains("COMMENT"))
+            .collect();
+        assert!(!body.is_empty(), "应至少有数据列行");
+        // 每个数据列行须以逗号结尾。
+        for line in &body {
+            assert!(
+                line.trim_end().ends_with(','),
+                "列定义应以逗号结尾，实际: {:?}",
+                line
+            );
+            // 类型与 COMMENT 之间须有空格（避免 NOT NULLCOMMENT 之类）。
+            assert!(
+                line.contains(" COMMENT '"),
+                "类型与 COMMENT 之间应有空格，实际: {:?}",
+                line
+            );
+        }
+        // id 列：AUTO_INCREMENT 后接空格再 COMMENT。
+        let id_line = body
+            .iter()
+            .find(|l| l.trim_start().starts_with("id"))
+            .expect("应存在 id 列");
+        assert!(id_line.contains("AUTO_INCREMENT COMMENT"), "id 列格式: {:?}", id_line);
+
+        // PRIMARY KEY 前一个数据列也应以逗号结尾（已由上面循环覆盖）。
+        assert!(sql.contains("PRIMARY KEY (id),"));
+        // 最后一个 INDEX 行无尾逗号，紧接 ) ENGINE。
+        assert!(sql.contains("    INDEX idx_ts (ts)\n) ENGINE=InnoDB"));
+    }
+}
+
+#[cfg(test)]
+mod dump {
+    #[test]
+    fn print_it() {
+        let yaml = r#"
+interval: 60
+retention_days: 30
+retention_interval: 3600
+timezone: "Asia/Shanghai"
+database: { host: "h", port: 3306, user: "u", password: "p", database: "db", table: "gpu_usage", max_connections: 10 }
+logging: { level: "info", dir: "./logs", all_file: "all.log", error_file: "error.log", rotation: "daily", archive_after_days: 7, archive_prefix: "logs", stdout: true }
+mapping:
+  enabled: true
+  sources:
+    - source_path: "./a.csv"
+      src_key: "namespace"
+      dest_key: "Namespace"
+      columns:
+        - source_field: "x"
+          rename: "location"
+          type: "varchar(255)"
+          comment: "loc"
+          position: { direction: after, anchor: "namespace" }
+sources:
+  - name: "s1"
+    ip: "1.1.1.1"
+    url: "http://1.1.1.1:9090"
+    primary: { metric: "m1", card_label: "gpu" }
+"#;
+        let cfg: crate::config::Config = serde_yaml::from_str(yaml).unwrap();
+        println!("===SQL===\n{}===END===", super::generate(&cfg));
     }
 }
