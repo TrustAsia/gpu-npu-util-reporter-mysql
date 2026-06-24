@@ -8,6 +8,7 @@ mod expr;
 mod extractor;
 mod mapping;
 mod models;
+mod sink;
 mod source;
 mod sql_gen;
 
