@@ -273,6 +273,15 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 
 /// 校验配置。失败返回 [`ConfigError`]，调用方应据此退出。
 pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
+    // 采集间隔必须为正，否则调度会忙循环空转。
+    if cfg.interval == 0 {
+        return Err(ConfigError("interval 必须 > 0".into()));
+    }
+    // 至少要有一个数据源，否则程序空跑。
+    if cfg.sources.is_empty() {
+        return Err(ConfigError("sources 不能为空".into()));
+    }
+
     // 时区合法性
     if cfg.timezone.parse::<chrono_tz::Tz>().is_err() {
         return Err(ConfigError(format!(
@@ -457,6 +466,22 @@ sources:
         for must in ["id", "ts", "ip", "card_id", "gpu_util", "source"] {
             assert!(names.contains(must), "固定列缺少 {}", must);
         }
+    }
+
+    #[test]
+    fn rejects_zero_interval() {
+        let yaml = valid_base_yaml().replace("interval: 60", "interval: 0");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_sources() {
+        // 删掉 sources 段后整体替换为空列表
+        let yaml = valid_base_yaml().split("sources:").next().unwrap().to_string()
+            + "sources: []";
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
     }
 
     /// 守护测试：示例配置 config.example.yaml 必须能解析并通过校验。
