@@ -6,6 +6,7 @@
 mod config;
 mod expr;
 mod models;
+mod source;
 
 fn main() {
     // 脚手架占位输出，后续任务替换为完整流程。

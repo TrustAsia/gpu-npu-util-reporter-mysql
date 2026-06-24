@@ -1,0 +1,16 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": { "__name__": "DCGM_FI_DEV_GPU_UTIL", "gpu": "0", "namespace": "default", "pod": "app-0" },
+        "value": [1719235200, "55"]
+      },
+      {
+        "metric": { "__name__": "DCGM_FI_DEV_GPU_UTIL", "gpu": "1", "namespace": "prod", "pod": "app-1" },
+        "value": [1719235200, "77"]
+      }
+    ]
+  }
+}
