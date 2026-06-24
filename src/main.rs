@@ -5,6 +5,7 @@
 
 mod config;
 mod expr;
+mod extractor;
 mod mapping;
 mod models;
 mod source;

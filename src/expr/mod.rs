@@ -229,6 +229,14 @@ pub fn is_valid(expr: &str) -> bool {
     parse(expr).is_ok()
 }
 
+/// 解析并求值一步到位：`expr` 为表达式原文，`vars` 为变量值表。
+///
+/// 语法错误（极少见，配置已校验）或运行期除零/缺变量都返回 `None`。
+/// 提供这个组合函数，使调用方（extractor）无需在跨模块边界命名私有的 [`Ast`]。
+pub fn eval(expr: &str, vars: &HashMap<String, f64>) -> Option<f64> {
+    parse(expr).ok().and_then(|ast| evaluate(&ast, vars))
+}
+
 /// 对 AST 求值。变量值由 `vars` 提供（key = metric 名，value = 该卡的值）。
 ///
 /// # 返回
