@@ -6,6 +6,7 @@
 mod config;
 mod expr;
 mod extractor;
+mod log_archive;
 mod mapping;
 mod models;
 mod scheduler;
