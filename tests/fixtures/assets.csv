@@ -1,0 +1,4 @@
+Namespace,机房位置,负责人
+default,机房A,张三
+prod,机房B,李四
+default,机房A重复,王五
