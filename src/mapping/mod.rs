@@ -16,7 +16,7 @@
 //! - 列的"最终名"由 [`crate::config::mapping_final_name`] 决定（rename 或 source_field）。
 //! - 列的"是否数值"由配置的 `type`（如 int/double/float 视为数值）决定。
 
-use crate::config::{MappingColumn, MappingConfig, MappingSource};
+use crate::config::{mapping_final_name, MappingConfig, MappingSource};
 use crate::models::Row as CollectorRow;
 use std::collections::HashMap;
 
@@ -33,13 +33,6 @@ pub struct AssetIndex {
 /// 加载错误（携带可读描述）。
 #[derive(Debug)]
 pub struct MappingError(pub String);
-
-/// 计算列最终名（rename 优先，缺省取 source_field）。等价于 config::mapping_final_name。
-fn final_name(col: &MappingColumn) -> String {
-    col.rename
-        .clone()
-        .unwrap_or_else(|| col.source_field.clone())
-}
 
 impl AssetIndex {
     /// 用行内 src_key 的值做 join，返回该匹配行所有声明列的字符串原值。
@@ -65,7 +58,7 @@ pub fn load_source(ms: &MappingSource) -> Result<AssetIndex, MappingError> {
     let columns: Vec<(String, String)> = ms
         .columns
         .iter()
-        .map(|c| (final_name(c), c.col_type.clone()))
+        .map(|c| (mapping_final_name(c), c.col_type.clone()))
         .collect();
     let rows = if ms.source_path.ends_with(".xlsx") {
         read_xlsx(ms)?
@@ -88,7 +81,7 @@ pub fn load_source(ms: &MappingSource) -> Result<AssetIndex, MappingError> {
         let filtered: HashMap<String, String> = ms
             .columns
             .iter()
-            .filter_map(|c| row.get(&c.source_field).map(|v| (final_name(c), v.clone())))
+            .filter_map(|c| row.get(&c.source_field).map(|v| (mapping_final_name(c), v.clone())))
             .collect();
         map.insert(key, filtered);
     }
@@ -154,7 +147,7 @@ pub fn load_all(cfg: &MappingConfig) -> Result<Vec<AssetIndex>, MappingError> {
 
 /// 判断配置的列类型是否为数值类型（影响 join 时是否尝试解析为数字）。
 fn is_numeric_type(col_type: &str) -> bool {
-    let lower = col_type.to_lowercase();
+    let lower = col_type.trim().to_lowercase();
     lower.starts_with("int")
         || lower.starts_with("double")
         || lower.starts_with("float")
@@ -191,7 +184,7 @@ pub fn join_row(
                 .and_then(|ms| {
                     ms.columns
                         .iter()
-                        .find(|c| final_name(c) == col_name)
+                        .find(|c| mapping_final_name(c) == col_name)
                         .map(|c| c.col_type.to_lowercase())
                 })
                 .unwrap_or_default();
