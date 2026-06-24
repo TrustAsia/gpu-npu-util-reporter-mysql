@@ -9,6 +9,7 @@ mod extractor;
 mod mapping;
 mod models;
 mod source;
+mod sql_gen;
 
 fn main() {
     // 脚手架占位输出，后续任务替换为完整流程。

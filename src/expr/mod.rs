@@ -246,6 +246,7 @@ pub fn eval(expr: &str, vars: &HashMap<String, f64>) -> Option<f64> {
 ///
 /// 这种"软失败"是有意为之：单张卡缺某个 metric 不应导致整个 source
 /// 本轮所有卡都丢失数据。
+#[allow(private_interfaces)]
 pub fn evaluate(ast: &Ast, vars: &HashMap<String, f64>) -> Option<f64> {
     match ast {
         Ast::Num(n) => Some(*n),
