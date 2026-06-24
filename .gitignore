@@ -1,0 +1,18 @@
+# macOS 系统文件
+.DS_Store
+
+# 编译产物
+/target
+
+# 运行时日志与归档（按日轮转/打包，不入库）
+/logs
+
+# --init 生成的建表 SQL（本地按需生成）
+/init
+
+# 实际配置（含数据库密码等敏感信息），不入库；示例配置 config.example.yaml 入库
+/config.yaml
+config.yaml.bak
+
+# 备份
+*.sql.bak

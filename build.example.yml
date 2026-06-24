@@ -1,0 +1,272 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            suffix: .exe
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            suffix: ""
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            suffix: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install ARM64 cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+
+      - name: Set musl static linking
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+
+      - name: Set ARM64 musl static linking
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Rename binary for release
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv gpu-npu-util-reporter${{ matrix.suffix }} gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}${{ matrix.suffix }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-npu-util-reporter-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}${{ matrix.suffix }}
+          if-no-files-found: error
+
+  # build-darwin (cross-rs/cross 方式，已替换为 zigbuild)
+  # build-darwin:
+  #   name: Build ${{ matrix.target }}
+  #   runs-on: ubuntu-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - target: x86_64-apple-darwin
+  #           cross-image: x86_64-apple-darwin-cross
+  #         - target: aarch64-apple-darwin
+  #           cross-image: aarch64-apple-darwin-cross
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install Rust toolchains
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: ${{ matrix.target }}
+  #
+  #     - name: Install nightly toolchain (build-std)
+  #       uses: dtolnay/rust-toolchain@nightly
+  #       with:
+  #         targets: ${{ matrix.target }}
+  #
+  #     - name: Checkout cross (with cross-toolchains submodule)
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: cross-rs/cross
+  #         path: cross
+  #         submodules: true
+  #
+  #     - name: Build cross Docker image with macOS SDK
+  #       working-directory: cross
+  #       run: |
+  #         cargo xtask build-docker-image ${{ matrix.cross-image }} --tag local \
+  #           --build-arg "MACOS_SDK_URL=https://github.com/joseluisq/macosx-sdks/releases/download/13.3/MacOSX13.3.sdk.tar.xz"
+  #
+  #     - name: Install cross
+  #       working-directory: cross
+  #       run: cargo install --path .
+  #
+  #     - name: Build
+  #       run: cross build --release --target ${{ matrix.target }}
+  #
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: gpu-npu-util-reporter-${{ matrix.target }}
+  #         path: target/${{ matrix.target }}/release/gpu-npu-util-reporter
+  #         if-no-files-found: error
+
+  build-darwin:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
+
+      - name: Download macOS SDK
+        run: |
+          curl -L -o MacOSX14.5.sdk.tar.xz \
+            https://github.com/joseluisq/macosx-sdks/releases/download/14.5/MacOSX14.5.sdk.tar.xz
+          tar -xf MacOSX14.5.sdk.tar.xz
+
+      - name: Build
+        env:
+          SDKROOT: ${{ github.workspace }}/MacOSX14.5.sdk
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rename binary for release
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv gpu-npu-util-reporter gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-npu-util-reporter-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: [build-native, build-darwin]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --tags
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          if git tag -l "v${VERSION}" | grep -q .; then
+            TAG="v${VERSION}+${SHORT_SHA}"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            TAG="v${VERSION}"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # 找到 HEAD 的祖先中版本号最大的 tag，避免取到其他分支的 tag
+          PREV_TAG=$(git tag --sort=-version:refname | while read -r t; do
+            if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+              echo "$t"
+              break
+            fi
+          done || true)
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log "${PREV_TAG}"..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          else
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+          fi
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "log<<${EOF}" >> "$GITHUB_OUTPUT"
+          echo "$LOG" >> "$GITHUB_OUTPUT"
+          echo "${EOF}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            ## Changes
+
+            ${{ steps.changelog.outputs.log }}
+
+            ## Downloads
+
+            | File | Platform |
+            |------|----------|
+            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.exe` | Windows x86_64 |
+            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl` | Linux x86_64 (static) |
+            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl` | Linux ARM64 (static) |
+            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-x86_64-apple-darwin` | macOS Intel |
+            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-aarch64-apple-darwin` | macOS Apple Silicon |
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ steps.tag.outputs.prerelease }}

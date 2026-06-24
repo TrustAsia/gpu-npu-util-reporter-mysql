@@ -1,0 +1,46 @@
+# =====================================================================
+# 计算卡利用率采集程序 (gpu-npu-util-reporter)
+# 二进制名与 CI workflow 一致；库名为 gpu_npu_util_reporter 供集成测试访问。
+# 版本号规则见 CLAUDE.md：每次改动同步更新 version。
+# =====================================================================
+[package]
+name = "gpu-npu-util-reporter"
+version = "0.1.0"
+edition = "2021"
+description = "定时从多个 Prometheus 服务器读取 GPU/NPU 及主机指标，按卡片维度对齐后写入 MySQL"
+
+[dependencies]
+# 异步运行时（full 提供 tokio::main / signal / 时间等）
+tokio = { version = "1", features = ["full"] }
+# HTTP 客户端：查 Prometheus。用 rustls 避免对系统 OpenSSL 的依赖（便于 musl 静态编译）
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# MySQL 连接池 + 异步查询。runtime-tokio-rustls 同样避免 OpenSSL
+sqlx = { version = "0.7", features = ["mysql", "runtime-tokio-rustls", "chrono", "macros"] }
+# 序列化：配置(YAML)、Prometheus 响应(JSON)、派生宏
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# 日志归档：tar.gz 打包超期散日志
+flate2 = "1"
+tar = "0.4"
+# 资产表读取（CSV / Excel）
+csv = "1"
+calamine = "0.24"
+# 命令行参数解析（--init）
+clap = { version = "4", features = ["derive"] }
+# 时间处理 + 时区
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+# 错误类型派生
+thiserror = "1"
+# 正则：提取表达式中的变量名(metric 名)
+regex = "1"
+# async trait：为 extractor 抽象可 mock 的查询接口
+async-trait = "0.1"
+
+[dev-dependencies]
+# 测试用 tokio 工具（test-util 提供 pause/advance 时间控制）
+tokio = { version = "1", features = ["full", "test-util"] }
