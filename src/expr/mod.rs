@@ -71,10 +71,14 @@ pub struct ParseError(pub String);
 ///
 /// # 返回
 /// 成功返回 AST；失败返回 [`ParseError`]。
+///
+/// 注：返回的 [`Ast`] 类型本身对外不透明（私有），调用方通过类型推断
+/// 接住它再交给 [`evaluate`]，不直接命名其类型。此处对编译器告警
+/// 显式静默：这是有意的"私有类型、公有函数"设计。
+#[allow(private_interfaces)]
 pub fn parse(input: &str) -> Result<Ast, ParseError> {
     let mut p = Parser {
         chars: input.chars().peekable(),
-        src: input,
     };
     let ast = p.parse_expr()?;
     p.skip_ws();
@@ -88,7 +92,6 @@ pub fn parse(input: &str) -> Result<Ast, ParseError> {
 /// 递归下降解析器。逐字符消费输入，通过 `peek` 做向前看一字符的判断。
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
-    src: &'a str,
 }
 
 impl<'a> Parser<'a> {
@@ -181,8 +184,8 @@ impl<'a> Parser<'a> {
             }
             // 数值字面量：以数字或小数点开头。
             Some(c) if c.is_ascii_digit() || *c == '.' => self.parse_number(),
-            // 变量：以字母或下划线开头。
-            Some(c) if c.is_alphabetic() || *c == '_' => self.parse_var(),
+            // 变量：以 ASCII 字母或下划线开头（严格匹配文法 [A-Za-z_]）。
+            Some(c) if c.is_ascii_alphabetic() || *c == '_' => self.parse_var(),
             other => Err(ParseError(format!("意外字符: {:?}", other))),
         }
     }
@@ -207,7 +210,7 @@ impl<'a> Parser<'a> {
     fn parse_var(&mut self) -> Result<Ast, ParseError> {
         let mut s = String::new();
         while let Some(&c) = self.chars.peek() {
-            if c.is_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || c == '_' {
                 s.push(c);
                 self.chars.next();
             } else {
