@@ -3,6 +3,7 @@
 //! 后续任务将在此串联配置加载、日志初始化、--init 模式、schema 校验、
 //! 调度与归档。当前仅为最小可编译占位，确保 CI 与依赖可正常拉取。
 
+mod config;
 mod expr;
 mod models;
 

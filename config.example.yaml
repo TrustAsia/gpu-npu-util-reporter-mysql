@@ -1,0 +1,122 @@
+# =====================================================================
+# 计算卡利用率采集配置（示例）
+# 本程序从多个 Prometheus 服务器读取计算卡与主机指标，按卡片维度对齐
+# 后写入 MySQL。本文件即为文档：每字段含注释。修改后需重启程序生效。
+#
+# 首次使用：复制为 config.yaml 并按实际环境修改。
+# =====================================================================
+
+# 全局默认采集间隔(秒)。必填。每个 source 可用自身 interval 覆盖。
+# 取值范围: 正整数。建议 >=15，过小会压垮 Prometheus。
+interval: 60
+
+# 数据保留期(天)。retention 任务据此定期删除早于该天数的旧行。
+retention_days: 30
+
+# 清理任务执行间隔(秒)。
+retention_interval: 3600
+
+# 时区。程序采集时间、MySQL 连接 session time_zone、保留期清理函数
+# 三方必须同一时区。取 IANA 名: Asia/Shanghai / UTC / America/New_York。
+timezone: "Asia/Shanghai"
+
+database:
+  host: "127.0.0.1"
+  port: 3306
+  user: "collector"
+  password: "secret"         # 实际使用请改为强密码，且勿提交到版本库
+  database: "gpu_metrics"
+  table: "gpu_usage"         # 写入目标表名。--init 据此生成 ./init/gpu_usage.sql
+  max_connections: 10        # 连接池大小
+  # schema 校验策略：正常启动对比实际表列与期望列。缺列恒报错退出；
+  # 多列时: ask(交互询问,非TTY回退continue) / continue(仅告警) / abort(退出)
+  on_extra_columns: "ask"
+
+# ---------------------------------------------------------------------
+# 日志配置
+# 双文件(完整日志 INFO+ / 错误日志 ERROR)。按日轮转。
+# 超期散日志(all+error)打包成单个 tar.gz 归档，散文件删除，压缩包永不删除。
+# ---------------------------------------------------------------------
+logging:
+  level: "info"              # error/warn/info/debug/trace
+  dir: "./logs"              # 日志目录(自动创建)，归档包也存于此
+  all_file: "all.log"        # 完整日志前缀(实际: all-2026-06-24.log)
+  error_file: "error.log"    # 错误日志前缀(实际: error-2026-06-24.log)
+  rotation: "daily"          # daily/hourly/never
+  archive_after_days: 7      # 散日志保留天数；超期后打包归档
+  archive_prefix: "logs"     # 归档包前缀(logs-2026-06-24.tar.gz)
+  stdout: true               # 是否同时输出 stdout(容器场景建议 true)
+
+# ---------------------------------------------------------------------
+# 资产表关联(可选)。enabled:false 时仍建列(--init 仍生成列)，采集不填值。
+# 语义: 用【行内】src_key 列值，去【资产表】dest_key 列查匹配行，
+#       把该匹配行的 columns 字段补进行。启动时加载一次，改资产表需重启。
+# ---------------------------------------------------------------------
+mapping:
+  enabled: true
+  sources:
+    - source_path: "./assets.csv"   # CSV 或 .xlsx
+      src_key: "namespace"          # 【行内】关联键(采集行中的列名)
+      dest_key: "Namespace"         # 【资产表】对应列名
+      # source_sheet: "Sheet1"      # 仅 Excel 有效，指定工作表
+      columns:
+        - source_field: "机房位置"  # 资产表中要关联的列
+          rename: "location"        # 可选，最终列名(缺省=source_field)
+          type: "varchar(255)"      # 列类型(写入建表SQL)
+          comment: "设备所在机房位置" # 列备注(写入SQL COMMENT)
+          position:                 # 列在表中位置(仅影响 --init SQL 顺序)
+            direction: after        # after/before
+            anchor: "namespace"     # 锚点列名(必须是已知列)
+        - source_field: "负责人"
+          rename: "owner"
+          type: "varchar(64)"
+          comment: "设备负责人"
+          position: { direction: after, anchor: "namespace" }
+
+# ---------------------------------------------------------------------
+# 数据源列表。卡类型差异完全靠配置表达，不改代码。
+# ---------------------------------------------------------------------
+sources:
+  # ===== 示例1: NVIDIA GPU (dcgm-exporter) =====
+  - name: "gpu-cluster-a"
+    ip: "10.0.0.1"                     # 本源主机IP(写入行的ip字段)
+    url: "http://10.0.0.1:9400"        # Prometheus 地址
+    timeout: 10                        # 查询超时(秒)，默认10
+    interval: 30                       # 覆盖全局 interval
+    primary:                           # 主指标：枚举所有卡片，决定行数
+      metric: "DCGM_FI_DEV_GPU_UTIL"
+      card_label: "gpu"                # dcgm 用 gpu 标签作卡号
+    fields:
+      - { name: "gpu_util", from: "metric", metric: "DCGM_FI_DEV_GPU_UTIL" }
+      - { name: "temp",     from: "metric", metric: "DCGM_FI_DEV_GPU_TEMP" }
+      - { name: "power",    from: "metric", metric: "DCGM_FI_DEV_POWER_USAGE" }
+      - { name: "namespace", from: "label", metric: "DCGM_FI_DEV_GPU_UTIL", label: "namespace" }
+      - { name: "pod",       from: "label", metric: "DCGM_FI_DEV_GPU_UTIL", label: "pod" }
+    expressions:
+      - name: "mem_util"
+        expr: "DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)"
+        unit: "%"
+    host_fields:
+      - name: "host_cpu"
+        expr: '100 - (avg by(instance)(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)'
+      - name: "host_mem"
+        expr: "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100"
+      - name: "host_fds"
+        expr: "node_filefd_allocated"
+
+  # ===== 示例2: 昇腾 NPU (npu-exporter) =====
+  - name: "npu-cluster-b"
+    ip: "10.0.0.2"
+    url: "http://10.0.0.2:9401"
+    primary:
+      metric: "npu_chip_info_utilization"
+      card_label: "id"                 # npu 用 id 标签作卡号
+    fields:
+      - { name: "gpu_util", from: "metric", metric: "npu_chip_info_utilization" }
+      - { name: "temp",     from: "metric", metric: "npu_chip_info_temperature" }
+      - { name: "power",    from: "metric", metric: "npu_chip_info_power" }
+      - { name: "namespace", from: "label", metric: "npu_chip_info_utilization", label: "namespace" }
+      - { name: "pod",       from: "label", metric: "npu_chip_info_utilization", label: "pod_name" }
+    expressions:
+      - name: "mem_util"
+        expr: "npu_chip_info_hbm_used_memory / npu_chip_info_hbm_total_memory"

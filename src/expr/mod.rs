@@ -221,6 +221,14 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// 仅判断表达式语法是否合法（不构造 AST 留给调用方）。
+///
+/// 供配置校验层使用：它只需"是否合法"这一布尔结论，无需拿到 AST，
+/// 从而不必在跨模块边界上触碰私有的 [`Ast`] 类型。
+pub fn is_valid(expr: &str) -> bool {
+    parse(expr).is_ok()
+}
+
 /// 对 AST 求值。变量值由 `vars` 提供（key = metric 名，value = 该卡的值）。
 ///
 /// # 返回
