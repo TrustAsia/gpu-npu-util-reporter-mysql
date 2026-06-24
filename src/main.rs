@@ -9,16 +9,8 @@
 //! 配置错误、MySQL 连不上、schema 缺列、资产表加载失败 → 立即退出（确定性错误，
 //! 重试无意义）。运行期错误由 scheduler/log_archive 各自隔离，不退出。
 
-mod config;
-mod expr;
-mod extractor;
-mod log_archive;
-mod mapping;
-mod models;
-mod scheduler;
-mod sink;
-mod source;
-mod sql_gen;
+// 业务模块来自库 crate（src/lib.rs），二进制仅做编排/CLI/日志/退出。
+use gpu_npu_util_reporter::{config, log_archive, mapping, scheduler, sink, source, sql_gen};
 
 use clap::Parser;
 use std::io::{self, Write};
