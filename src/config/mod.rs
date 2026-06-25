@@ -312,6 +312,27 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError("sources 不能为空".into()));
     }
 
+    // max_connections=0 会让连接池容量为 0：sqlx 的许可信号量初始 permits=0，
+    // `Sink::connect`（其内部 `connect_with` 会 acquire 一个连接）会在此**永久挂起**，
+    // 程序启动后无任何日志、无报错即卡死（连 schema 校验都到不了）。
+    // 这比 interval=0（忙循环浪费资源）严重得多——是彻底的死锁式挂起，故必须拦截。
+    if cfg.database.max_connections == 0 {
+        return Err(ConfigError(
+            "database.max_connections 必须 > 0（0 会让连接池无法建立任何连接，启动即永久挂起）".into(),
+        ));
+    }
+
+    // archive_after_days=0 会让归档 cutoff=今天，即 `日期 <= 今天` 成立，
+    // 当天正在写入的 all/error 散日志会在下一个整点被打包并删除。
+    // CachedAppendFile 仍持有已打开句柄：Unix 下文件已从磁盘删除（后续日志写进
+    // 已删除的 inode，到下次跨天重开前静默丢失且不可见），Windows 下句柄占用导致删除失败。
+    // 无论哪种结果都是日志数据完整性问题，故必须 > 0。
+    if cfg.logging.archive_after_days == 0 {
+        return Err(ConfigError(
+            "logging.archive_after_days 必须 > 0（0 会归档当天正在写入的活跃日志）".into(),
+        ));
+    }
+
     // 时区合法性
     if cfg.timezone.parse::<chrono_tz::Tz>().is_err() {
         return Err(ConfigError(format!(
@@ -658,6 +679,24 @@ sources:
             "max_connections: 10",
             "max_connections: 10\n  on_extra_columns: \"strict\"",
         );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：max_connections=0 会让 sqlx 连接池 permits=0，启动期 `Sink::connect`
+    /// 内部的 acquire 永久挂起（无日志无报错即卡死），必须早期拦截。
+    #[test]
+    fn rejects_zero_max_connections() {
+        let yaml = valid_base_yaml().replace("max_connections: 10", "max_connections: 0");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：archive_after_days=0 会让 cutoff=今天，归档循环会在下一个整点把
+    /// 当天正在写入的活跃散日志打包并删除（句柄仍开着 → 日志静默丢失），必须 > 0。
+    #[test]
+    fn rejects_zero_archive_after_days() {
+        let yaml = valid_base_yaml().replace("archive_after_days: 7", "archive_after_days: 0");
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         assert!(validate(&cfg).is_err());
     }

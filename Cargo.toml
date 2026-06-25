@@ -5,7 +5,7 @@
 # =====================================================================
 [package]
 name = "gpu-npu-util-reporter-mysql"
-version = "0.15.5"
+version = "0.15.6"
 edition = "2021"
 description = "定时从多个 Prometheus 服务器读取 GPU/NPU 及主机指标，按卡片维度对齐后写入 MySQL"
 

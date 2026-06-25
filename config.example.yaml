@@ -27,7 +27,7 @@ database:
   password: "secret"         # 实际使用请改为强密码，且勿提交到版本库
   database: "gpu_metrics"
   table: "gpu_usage"         # 写入目标表名。--init 据此生成 ./init/gpu_usage.sql
-  max_connections: 10        # 连接池大小
+  max_connections: 10        # 连接池大小(必须 >0；0 会让启动永久挂起)
   # schema 校验策略：正常启动对比实际表列与期望列。缺列恒报错退出；
   # 多列时: ask(交互询问,非TTY回退continue) / continue(仅告警) / abort(退出)
   on_extra_columns: "ask"
@@ -43,7 +43,7 @@ logging:
   all_file: "all.log"        # 完整日志前缀(实际: all-2026-06-24.log)
   error_file: "error.log"    # 错误日志前缀(实际: error-2026-06-24.log)
   rotation: "daily"          # daily/hourly/never
-  archive_after_days: 7      # 散日志保留天数；超期后打包归档
+  archive_after_days: 7      # 散日志保留天数(必须 >0)；超期后打包归档
   archive_prefix: "logs"     # 归档包前缀(logs-2026-06-24.tar.gz)
   stdout: true               # 是否同时输出 stdout(容器场景建议 true)
 
