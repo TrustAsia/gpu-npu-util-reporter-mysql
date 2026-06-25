@@ -26,7 +26,9 @@ database:
   user: "collector"
   password: "secret"         # 实际使用请改为强密码，且勿提交到版本库
   database: "gpu_metrics"
-  table: "gpu_usage"         # 写入目标表名。--init 据此生成 ./init/gpu_usage.sql
+  table: "gpu_usage"         # 写入目标表名。--init 据此生成 ./init/gpu_usage.sql。
+                            # 仅允许 [A-Za-z_][A-Za-z0-9_]*（勿用连字符/空格/引号/保留字，
+                            # 会被原样拼进 SQL 在运行期触发模糊语法错误）。
   max_connections: 10        # 连接池大小(必须 >0；0 会让启动永久挂起)
   # schema 校验策略：正常启动对比实际表列与期望列。缺列恒报错退出；
   # 多列时: ask(交互询问,非TTY回退continue) / continue(仅告警) / abort(退出)

@@ -255,6 +255,20 @@ pub fn mapping_final_name(col: &MappingColumn) -> String {
         .unwrap_or_else(|| col.source_field.clone())
 }
 
+/// 判断是否为 MySQL 合法的**无引号**标识符：`[A-Za-z_][A-Za-z0-9_]*`，且非空。
+///
+/// 用于校验 `database.table`（被原样拼接进 CREATE/INSERT/DELETE/INFORMATION_SCHEMA
+/// 等多处 SQL，无法参数化绑定）。非空字符集之外的名字（含连字符、空格、引号、
+/// 保留字等）应改用反引号转义或更换命名，而非在此放行——保持与启动期失败原则一致。
+fn is_valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// 配置错误(携带可读描述)。
 #[derive(Debug)]
 pub struct ConfigError(pub String);
@@ -320,6 +334,20 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError(
             "database.max_connections 必须 > 0（0 会让连接池无法建立任何连接，启动即永久挂起）".into(),
         ));
+    }
+
+    // table 名被**原样拼接**进多处 SQL：CREATE TABLE {}、INSERT INTO {}、
+    // DELETE FROM {}、INFORMATION_SCHEMA … TABLE_NAME='{}'，以及 --init 输出文件名。
+    // 这些都是裸标识符/字符串字面量插值，无法用参数绑定。若 table 名含连字符
+    // (`gpu-usage`)、空格、引号、分号或为保留字 (`order`)，会在运行期产生模糊的
+    // MySQL 语法错误（而非启动期清晰提示），且构成注入面。这与 R1-R9 的"启动即失败"
+    // 原则相悖，故在此按 MySQL 无引号标识符字符集 [A-Za-z_][A-Za-z0-9_]* 拦截。
+    // （时区已由 IANA 解析保证受限字符集，故无需同类校验。）
+    if !is_valid_identifier(&cfg.database.table) {
+        return Err(ConfigError(format!(
+            "database.table '{}' 非法：须为 MySQL 合法标识符 [A-Za-z_][A-Za-z0-9_]*（勿用连字符/空格/引号/保留字）",
+            cfg.database.table
+        )));
     }
 
     // archive_after_days=0 会让归档 cutoff=今天，即 `日期 <= 今天` 成立，
@@ -699,6 +727,42 @@ sources:
         let yaml = valid_base_yaml().replace("archive_after_days: 7", "archive_after_days: 0");
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：含连字符的表名（如 `gpu-usage`）会被原样拼进 CREATE/INSERT/DELETE 等
+    /// SQL（裸标识符插值，无法参数化），在运行期产生模糊语法错误而非启动期提示，
+    /// 必须在 validate 早期拦截。
+    #[test]
+    fn rejects_table_name_with_hyphen() {
+        let yaml = valid_base_yaml().replace("table: \"gpu_usage\"", "table: \"gpu-usage\"");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：含非法字符的表名（空格、引号、分号、首字符为数字等）会被原样拼进
+    /// CREATE/INSERT/DELETE 等 SQL（裸标识符插值，无法参数化），在运行期产生模糊
+    /// 语法错误而非启动期提示，必须在 validate 早期拦截。
+    ///
+    /// 注：MySQL 保留字（如 order/group）属另一维度——维护 250+ 条版本相关的保留字
+    /// 黑名单成本远高于收益（运维方极少如此命名），且示例配置注释已提示避免；
+    /// 故本校验范围限定为"字符集合法"，保留字检测不在内。
+    #[test]
+    fn rejects_table_name_with_injection_chars() {
+        for bad in ["gpu usage", "gpu'; DROP--", "gpu-usage", "", "1gpu", "a.b", "a`b"] {
+            let yaml = valid_base_yaml().replace("table: \"gpu_usage\"", &format!("table: \"{bad}\""));
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(validate(&cfg).is_err(), "应拒绝非法表名: {:?}", bad);
+        }
+    }
+
+    /// 守护：合法表名（含下划线/数字/混排）不应被误伤。
+    #[test]
+    fn accepts_valid_table_names() {
+        for ok in ["gpu_usage", "GpuUsage", "_t", "t1", "a_b_c_1"] {
+            let yaml = valid_base_yaml().replace("table: \"gpu_usage\"", &format!("table: \"{ok}\""));
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(validate(&cfg).is_ok(), "合法表名不应被拒: {:?}", ok);
+        }
     }
 
     /// 守护：同一 mapping 下多个列声明相同最终名应被拒绝（避免重复列）。
