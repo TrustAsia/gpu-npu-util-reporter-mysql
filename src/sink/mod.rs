@@ -15,7 +15,7 @@ pub mod schema;
 use crate::config::{mapping_final_name, Config};
 use crate::models::Row;
 use schema::{compare, SchemaCheck};
-use sqlx::mysql::MySqlPoolOptions;
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::MySqlPool;
 use std::collections::HashSet;
 
@@ -36,14 +36,18 @@ impl Sink {
     /// 回调在每个连接建立时统一设置（仅 set 一次连接不够：池中其它连接不会被设置，
     /// 会影响 `run_retention` 里 `NOW()` 的时区基准）。
     pub async fn connect(cfg: &Config) -> Result<Self, SinkError> {
-        let url = format!(
-            "mysql://{}:{}@{}:{}/{}",
-            cfg.database.user,
-            cfg.database.password,
-            cfg.database.host,
-            cfg.database.port,
-            cfg.database.database
-        );
+        // 用 MySqlConnectOptions 的 builder API 构造连接参数，而非拼接
+        // `mysql://user:password@host` URL。原因：password 中若含 `@`/`:`/`/`/`#`/空格
+        // 等字符（生成式密码极常见，如 `P@ss:w0rd/123`），原样 format! 进 URL 会被
+        // sqlx 的 URL 解析器错切（`@` 被当主机分隔符、`#` 截断 fragment 等），导致
+        // "连接失败"或连到错误的主机——这与 R10(表名插值)同性质的"配置值原样拼接"
+        // 隐患。builder API 各字段以 &str 直传，不经 URL 编码/解析，从根上消除该问题。
+        let options = MySqlConnectOptions::new()
+            .host(&cfg.database.host)
+            .port(cfg.database.port)
+            .username(&cfg.database.user)
+            .password(&cfg.database.password)
+            .database(&cfg.database.database);
         let tz_sql = schema::set_timezone_sql(&cfg.timezone);
         let pool = MySqlPoolOptions::new()
             .max_connections(cfg.database.max_connections)
@@ -54,7 +58,7 @@ impl Sink {
                     sqlx::query(&sql).execute(conn).await.map(|_| ())
                 })
             })
-            .connect(&url)
+            .connect_with(options)
             .await
             .map_err(|e| SinkError(format!("连接 MySQL 失败: {}", e)))?;
         Ok(Self {
@@ -299,5 +303,31 @@ mod tests {
             ),
             other => panic!("{} 位置期望 F64(Some({}))，实际 {:?}", col, expect, other),
         }
+    }
+
+    /// 守护 R12：含特殊字符的密码（`@`/`:`/`/`/`#`/空格，生成式密码极常见）
+    /// 若用 `format!` 拼进 `mysql://user:pass@host` URL，`@` 会被当成主机分隔符、
+    /// `#` 截断 fragment，导致连到错误主机或连接失败。改用 `MySqlConnectOptions`
+    /// 的 builder API（字段以 &str 直传，不经 URL 解析）后，密码被正确 percent-编码，
+    /// host/port/username 不受影响。本测试用 `to_url_lossy()` 重建 URL 验证字段完整
+    /// （无需联网）。
+    #[test]
+    fn connect_options_preserves_special_char_password() {
+        use sqlx::ConnectOptions;
+        let opts = MySqlConnectOptions::new()
+            .host("10.0.0.1")
+            .port(3306)
+            .username("u")
+            .password("P@ss:w0rd/123#x")
+            .database("db");
+        let url = opts.to_url_lossy();
+        // host/port/username 必须完好（旧 format! 方式会让 @ 截断 host）。
+        assert_eq!(url.host_str(), Some("10.0.0.1"), "host 不应被密码里的 @ 破坏");
+        assert_eq!(url.port(), Some(3306), "port 应保留");
+        assert_eq!(url.username(), "u", "username 应保留");
+        // 密码经 percent-编码后应含编码后的 @ (%40)，而非裸 @（裸 @ 会再次被解析为分隔符）。
+        let pw = url.password().expect("密码应存在");
+        assert!(pw.contains("%40"), "密码里的 @ 应被编码为 %40，实际: {}", pw);
+        assert!(!pw.contains('@'), "密码里不应残留裸 @，实际: {}", pw);
     }
 }

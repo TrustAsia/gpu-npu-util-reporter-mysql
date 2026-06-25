@@ -93,9 +93,12 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         match client.query(&hf.expr).await {
             Ok(samples) => {
                 if let Some(first) = samples.first() {
-                    host_values.insert(hf.name.clone(), first.value);
+                    // 非有限值（NaN/±Inf）规范化为缺席 → 后续填 NULL（见 finite_or_none 文档）。
+                    if first.value.is_finite() {
+                        host_values.insert(hf.name.clone(), first.value);
+                    }
                 }
-                // 无结果则该字段缺席（后续填 NULL）。
+                // 无结果或非有限值 → 该字段缺席（后续填 NULL）。
             }
             Err(e) => {
                 tracing::warn!(
@@ -127,7 +130,11 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         for fc in &cfg.fields {
             match fc.from.as_str() {
                 "metric" => {
-                    let v = value_idx.get(&fc.metric).and_then(|m| m.get(&key)).copied();
+                    let v = value_idx
+                        .get(&fc.metric)
+                        .and_then(|m| m.get(&key))
+                        .copied()
+                        .and_then(finite_or_none);
                     row.fields.insert(fc.name.clone(), v);
                 }
                 "label" => {
@@ -149,7 +156,7 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         for ec in &cfg.expressions {
             let vars = build_vars_for_expr(&ec.expr, &key, &value_idx);
             // 用 expr::eval 一步求值，避免跨模块命名私有的 Ast。
-            let val = expr::eval(&ec.expr, &vars);
+            let val = expr::eval(&ec.expr, &vars).and_then(finite_or_none);
             row.fields.insert(ec.name.clone(), val);
         }
 
@@ -207,6 +214,33 @@ fn build_vars_for_expr(
     vars
 }
 
+/// 把非有限浮点（NaN / +Inf / -Inf）规范化为 `None`。
+///
+/// Prometheus exporter 在卡空闲/异常时确实会发出 `"NaN"`（如除零派生指标）、
+/// `"+Inf"`/`"-Inf"`（如空闲卡的某些比率），而 Rust 的 `f64::parse` **成功接受**
+/// 这些字符串（与解析失败不同）。这些值一旦流入 `Row.fields` 再被 sink 绑定到
+/// MySQL 的 DOUBLE 列，会触发两类静默问题：
+///
+/// - MySQL 不支持 NaN/Inf 表示：非严格 `sql_mode` 下存成截断/零值（**数据失真**），
+///   严格模式下整行 INSERT 失败（**本轮该源全部丢数**）。
+/// - sqlx-mysql 0.7 的 `Encode<f64>` 实现是 `buf.extend(&self.to_le_bytes())`，
+///   **无 `is_finite()` 守卫**，原样写入 IEEE-754 位模式，问题不会被提前拦下。
+///
+/// 与缺字段写 NULL 的"软失败"语义一致：单张卡某指标无效只让该字段写 NULL，
+/// 不污染整行、不丢失本轮其它字段。返回 `None` 后 sink 绑定 `Option<f64> = None`
+/// → 落库为 NULL。
+fn finite_or_none(v: f64) -> Option<f64> {
+    if v.is_finite() {
+        Some(v)
+    } else {
+        tracing::warn!(
+            value = v,
+            "采集值非有限(NaN/Inf)，该字段写 NULL 而非落入 MySQL DOUBLE 列"
+        );
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +260,18 @@ mod tests {
         assert!(!vars.iter().any(|v| v == "100"));
         assert!(vars.contains(&"A".to_string()));
         assert!(vars.contains(&"B".to_string()));
+    }
+
+    /// 守护 R11：finite_or_none 把非有限值（NaN/±Inf）转 None（→ NULL），
+    /// 有限值原样保留。即使 source 层已拦截 NaN/Inf，表达式运算仍可能产生
+    /// 非有限结果（如 inf - inf = NaN），故此处仍需兜底。
+    #[test]
+    fn finite_or_none_normalizes_non_finite() {
+        assert_eq!(finite_or_none(0.0), Some(0.0));
+        assert_eq!(finite_or_none(-1.5), Some(-1.5));
+        assert_eq!(finite_or_none(1e308), Some(1e308)); // 仍有限
+        assert_eq!(finite_or_none(f64::NAN), None);
+        assert_eq!(finite_or_none(f64::INFINITY), None);
+        assert_eq!(finite_or_none(f64::NEG_INFINITY), None);
     }
 }

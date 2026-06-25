@@ -109,14 +109,23 @@ pub fn parse_vector(body: &str) -> Result<Vec<MetricSample>, SourceError> {
                 labels.insert(k.clone(), s.to_string());
             }
         }
-        // value: [timestamp, "数值字符串"]，取第二元素解析为 f64
-        let value = item
+        // value: [timestamp, "数值字符串"]，取第二元素解析为 f64。
+        // 拒绝 NaN / ±Inf：Rust 的 f64::parse 会**成功**接受 "NaN"/"+Inf"/"-Inf"
+        // （Prometheus exporter 对空闲/异常卡确会发出这些），但 MySQL 的 DOUBLE 列
+        // 无法表示它们（非严格模式存成截断值/0 = 数据失真；严格模式整行 INSERT 失败）。
+        // 解析失败或非有限的样本**跳过**（而非整响应报错）：单条坏样本不应连累
+        // 同批其它正常样本被丢弃，与 extractor 缺字段写 NULL 的软失败语义一致。
+        // extractor 层另有 finite_or_none 兜底表达式运算可能产生的非有限结果。
+        let Some(value) = item
             .get("value")
             .and_then(|x| x.as_array())
             .and_then(|a| a.get(1))
             .and_then(|x| x.as_str())
             .and_then(|s| s.parse::<f64>().ok())
-            .ok_or_else(|| SourceError("缺少 value 或无法解析为数字".into()))?;
+            .filter(|v| v.is_finite())
+        else {
+            continue;
+        };
         out.push(MetricSample { labels, value });
     }
     Ok(out)
@@ -144,9 +153,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_numeric_value() {
+    fn skips_unparseable_value_sample() {
+        // 无法解析为 f64 的 value：该样本被跳过（而非整响应报错），
+        // 与跳过 NaN/Inf 的语义一致——单条坏样本不连累同批正常样本。
         let body = r#"{"data":{"result":[{"metric":{},"value":[1,"NaN-xxx"]}]}}"#;
-        assert!(parse_vector(body).is_err());
+        let samples = parse_vector(body).unwrap();
+        assert!(samples.is_empty());
+    }
+
+    /// 守护 R11：裸 "NaN" 会被 Rust 的 f64::parse **成功**接受（与 "NaN-xxx" 不同），
+    /// 但 MySQL DOUBLE 无法表示。解析边界须将其跳过，保证进程序的值恒有限。
+    /// 同理覆盖 "+Inf"/"-Inf"/"Infinity"。该样本被丢弃，但同批正常样本保留。
+    #[test]
+    fn skips_nan_and_inf_samples_keeps_finite() {
+        let body = r#"{"data":{"result":[
+            {"metric":{"gpu":"0"},"value":[1,"NaN"]},
+            {"metric":{"gpu":"1"},"value":[1,"+Inf"]},
+            {"metric":{"gpu":"2"},"value":[1,"-Infinity"]},
+            {"metric":{"gpu":"3"},"value":[1,"42.0"]}
+        ]}}"#;
+        let samples = parse_vector(body).unwrap();
+        // 仅卡3（有限值）保留；NaN/Inf 三条被跳过。
+        assert_eq!(samples.len(), 1, "NaN/Inf 样本应被跳过，仅保留有限值");
+        assert_eq!(samples[0].labels.get("gpu").unwrap(), "3");
+        assert_eq!(samples[0].value, 42.0);
     }
 
     #[test]

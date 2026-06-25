@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "gpu-npu-util-reporter-mysql"
-version = "0.15.8"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "calamine",
