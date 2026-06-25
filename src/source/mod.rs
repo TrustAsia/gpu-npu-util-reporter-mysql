@@ -116,16 +116,20 @@ pub fn parse_vector(body: &str) -> Result<Vec<MetricSample>, SourceError> {
         // 解析失败或非有限的样本**跳过**（而非整响应报错）：单条坏样本不应连累
         // 同批其它正常样本被丢弃，与 extractor 缺字段写 NULL 的软失败语义一致。
         // extractor 层另有 finite_or_none 兜底表达式运算可能产生的非有限结果。
-        let Some(value) = item
+        let value_raw = item
             .get("value")
             .and_then(|x| x.as_array())
             .and_then(|a| a.get(1))
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-        else {
+            .and_then(|x| x.as_str());
+        let Some(parsed) = value_raw.and_then(|s| s.parse::<f64>().ok()) else {
+            tracing::debug!(value = ?value_raw, "样本值无法解析为 f64，跳过该样本");
             continue;
         };
+        if !parsed.is_finite() {
+            tracing::debug!(value = parsed, "样本值为 NaN/Inf，跳过该样本(MySQL DOUBLE 无法表示)");
+            continue;
+        }
+        let value = parsed;
         out.push(MetricSample { labels, value });
     }
     Ok(out)
