@@ -202,9 +202,10 @@ async fn main() {
         .await;
     });
 
-    // 优雅退出：捕获 SIGINT(Ctrl+C) 或 SIGTERM(容器停止)，等当前轮完成再退出。
-    // SIGTERM 是 Kubernetes/Docker 停止容器的信号，必须处理（spec §9）。
-    tracing::info!("已启动所有采集与维护任务，等待 SIGINT/SIGTERM 退出");
+    // 优雅退出：捕获中断信号(Ctrl+C / 容器停止)，等当前轮完成再退出。
+    // Unix 监听 SIGINT/SIGTERM；Windows 监听 Ctrl+C / 控制台关闭
+    // （见 wait_for_shutdown_signal 的平台分支）。
+    tracing::info!("已启动所有采集与维护任务，等待中断信号退出");
     wait_for_shutdown_signal().await;
     tracing::info!("收到退出信号，等待当前轮采集/写入完成...");
     shutdown.store(true, std::sync::atomic::Ordering::Release);
@@ -217,7 +218,14 @@ async fn main() {
     tracing::info!("已优雅退出");
 }
 
-/// 等待 SIGINT 或 SIGTERM（二者任一到达即返回）。
+/// 等待退出信号（任一到达即返回），用于优雅退出。
+///
+/// 平台差异由条件编译隔离：
+/// - **Unix**(Linux/macOS)：监听 SIGINT(Ctrl+C) 与 SIGTERM（Kubernetes/Docker 停止
+///   容器的信号）。二者等价处理，置位 shutdown 后等当前轮完成再退出。
+/// - **Windows**：无 SIGTERM 概念。监听 Ctrl+C 与"控制台关闭事件"（用户关控制台
+///   窗口或 `Stop-Process`，对应 docker stop 的近似场景）。
+#[cfg(unix)]
 async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigint = signal(SignalKind::interrupt()).expect("注册 SIGINT 失败");
@@ -225,6 +233,18 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         _ = sigint.recv() => tracing::info!("收到 SIGINT"),
         _ = sigterm.recv() => tracing::info!("收到 SIGTERM"),
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows;
+    // ctrl_c 对应 Ctrl+C；ctrl_close 对应关闭控制台窗口（容器停止的近似场景）。
+    let mut ctrl_c = windows::ctrl_c().expect("注册 Ctrl+C 失败");
+    let mut ctrl_close = windows::ctrl_close().expect("注册 Ctrl+Close 失败");
+    tokio::select! {
+        _ = ctrl_c.recv() => tracing::info!("收到 Ctrl+C"),
+        _ = ctrl_close.recv() => tracing::info!("收到 Ctrl+Close"),
     }
 }
 
