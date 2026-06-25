@@ -258,8 +258,12 @@ pub fn mapping_final_name(col: &MappingColumn) -> String {
 /// 判断是否为 MySQL 合法的**无引号**标识符：`[A-Za-z_][A-Za-z0-9_]*`，且非空。
 ///
 /// 用于校验 `database.table`（被原样拼接进 CREATE/INSERT/DELETE/INFORMATION_SCHEMA
-/// 等多处 SQL，无法参数化绑定）。非空字符集之外的名字（含连字符、空格、引号、
-/// 保留字等）应改用反引号转义或更换命名，而非在此放行——保持与启动期失败原则一致。
+/// 等多处 SQL，无法参数化绑定）。字符集之外的名字（含连字符、空格、引号、点等）
+/// 应在此拦截，保持与启动期失败原则一致。
+///
+/// **注意：仅校验字符集，不校验保留字。** MySQL 保留字（order/group/select 等）
+/// 满足本字符集但作表名时仍需反引号转义。维护 250+ 条版本相关的保留字黑名单成本
+/// 远高于收益（运维方极少如此命名），故不在本检查范围；示例配置注释已提示避免。
 fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -339,9 +343,10 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // table 名被**原样拼接**进多处 SQL：CREATE TABLE {}、INSERT INTO {}、
     // DELETE FROM {}、INFORMATION_SCHEMA … TABLE_NAME='{}'，以及 --init 输出文件名。
     // 这些都是裸标识符/字符串字面量插值，无法用参数绑定。若 table 名含连字符
-    // (`gpu-usage`)、空格、引号、分号或为保留字 (`order`)，会在运行期产生模糊的
+    // (`gpu-usage`)、空格、引号、分号或首字符为数字，会在运行期产生模糊的
     // MySQL 语法错误（而非启动期清晰提示），且构成注入面。这与 R1-R9 的"启动即失败"
     // 原则相悖，故在此按 MySQL 无引号标识符字符集 [A-Za-z_][A-Za-z0-9_]* 拦截。
+    // 仅校验字符集，不含保留字检测（见 is_valid_identifier 文档）。
     // （时区已由 IANA 解析保证受限字符集，故无需同类校验。）
     if !is_valid_identifier(&cfg.database.table) {
         return Err(ConfigError(format!(
