@@ -291,7 +291,16 @@ struct CachedAppendFile {
 /// 受保护的数据（文件句柄、目录已建标记）在 panic 后访问并无内存安全问题
 /// （文件 I/O 错误会以 `io::Result::Err` 正常返回），故用 `into_inner()` 取出内部值继续。
 fn lock_or_recover<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.lock().unwrap_or_else(|poisoned| {
+        // 记 ERROR 让"Mutex 中毒"事件可被发现：否则恢复是静默的，运维无从得知
+        // 日志层曾因某次写 panic 而降级（后续 I/O 错误虽会以 io::Result::Err 返回，
+        // 但无法区分"偶发磁盘抖动"与"句柄已处于中毒后状态"）。
+        tracing::error!(
+            target: "logging",
+            "日志 Mutex 中毒（曾发生写 panic），已恢复访问；请排查此前日志层的 panic"
+        );
+        poisoned.into_inner()
+    })
 }
 
 impl CachedAppendFile {

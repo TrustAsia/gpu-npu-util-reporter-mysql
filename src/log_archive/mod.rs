@@ -131,6 +131,11 @@ fn scatter_path(dir: &Path, base: &str, date_str: &str) -> PathBuf {
 /// 孤儿 `.tmp`，该文件永不被正常流程清理（散文件删后不会再触发该日期的归档）。
 /// 本函数扫描目录删除所有 `<prefix>-` 开头、`.tar.gz.tmp` 结尾的文件；删除失败只记
 /// WARN（可能是并发归档正在写，不视作错误）。函数无副作用要求，目录读失败时静默返回。
+///
+/// **并发前提**：本程序为单进程守护（`main` 仅 spawn 一个 `run_loop` 任务），目录内
+/// 不会有第二个归档写入者。若未来支持多进程共用同一日志目录，此处的无条件删除会与
+/// 正在写 `.tmp` 的另一进程竞态（删其正在写的文件 → 该进程 rename 出损坏包），届时
+/// 须改为按文件 mtime 判定（仅删足够老的 `.tmp`）或加文件锁。
 fn cleanup_stale_tmp(dir: &Path, prefix: &str) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
