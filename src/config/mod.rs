@@ -204,8 +204,6 @@ pub struct ExprConfig {
     pub name: String,
     /// 表达式，变量名 = metric 名(见 [`crate::expr`])。
     pub expr: String,
-    /// 可选单位备注。
-    pub unit: Option<String>,
 }
 
 /// 主机级字段(整主机一个值，按 ip 复制到该主机每张卡)。
@@ -246,6 +244,46 @@ pub fn fixed_column_names() -> HashSet<String> {
         .collect()
 }
 
+/// 固定列中由 sink 直接从结构字段取值（不查 row.fields/strings）的列名。
+/// 配置在 fields/expressions/host_fields 里用这些名，值会被静默丢弃。
+fn is_structural_column(name: &str) -> bool {
+    matches!(name, "id" | "ts" | "ip" | "card_id" | "source")
+}
+
+/// 可写的**数值**固定列名集合（`DOUBLE` 且非结构列）。
+///
+/// 由 [`FIXED_COLUMNS`] 派生，与 sink 的 `fixed_write_values` 保持同一真相源。
+/// `from: metric` / `expressions` / `host_fields` 的 `name` 必须落在此集合内——
+/// 否则 extractor 把值写进 `row.fields`（按配置名建键），而 sink 只按固定名读取，
+/// 该值永远不会被绑定落库（静默 NULL + 丢值），且 schema 校验抓不到
+/// （`expected_columns` 不含这些名）。
+fn writable_numeric_columns() -> HashSet<&'static str> {
+    FIXED_COLUMNS
+        .iter()
+        .filter(|(n, t, _, _)| !is_structural_column(n) && t.starts_with("DOUBLE"))
+        .map(|(n, _, _, _)| *n)
+        .collect()
+}
+
+/// 可写的**字符串**固定列名集合（`VARCHAR` 且非结构列，即 `namespace`/`pod`）。
+///
+/// `from: label` 字段的 `name` 必须落在此集合内。资产表列由 mapping 的 `join_row`
+/// 填充（独立来源），不应由 Prometheus 标签字段覆盖，故 from=label 仅限 namespace/pod。
+fn writable_string_columns() -> HashSet<&'static str> {
+    FIXED_COLUMNS
+        .iter()
+        .filter(|(n, t, _, _)| !is_structural_column(n) && t.starts_with("VARCHAR"))
+        .map(|(n, _, _, _)| *n)
+        .collect()
+}
+
+/// 把列名集合排序成 " / " 分隔的可读串，用于错误提示（顺序确定，便于复现）。
+fn sorted_list(set: &HashSet<&str>) -> String {
+    let mut v: Vec<&str> = set.iter().copied().collect();
+    v.sort();
+    v.join(" / ")
+}
+
 /// 计算 mapping 列最终名(rename 优先，缺省取 source_field)。
 ///
 /// 供 sql_gen/sink 复用，避免各处重复这段逻辑。
@@ -257,20 +295,36 @@ pub fn mapping_final_name(col: &MappingColumn) -> String {
 
 /// 判断是否为 MySQL 合法的**无引号**标识符：`[A-Za-z_][A-Za-z0-9_]*`，且非空。
 ///
-/// 用于校验 `database.table`（被原样拼接进 CREATE/INSERT/DELETE/INFORMATION_SCHEMA
-/// 等多处 SQL，无法参数化绑定）。字符集之外的名字（含连字符、空格、引号、点等）
-/// 应在此拦截，保持与启动期失败原则一致。
+/// 用于校验所有"原样拼接进 SQL"的标识符：`database.table`（CREATE/INSERT/DELETE/
+/// INFORMATION_SCHEMA）、mapping 最终列名（INSERT 列名、CREATE TABLE 列名）。
+/// 这些都是裸标识符插值，无法用参数绑定，故字符集之外的名字（含连字符、空格、
+/// 引号、点等）应在此拦截，保持"启动期失败"原则。
 ///
 /// **注意：仅校验字符集，不校验保留字。** MySQL 保留字（order/group/select 等）
 /// 满足本字符集但作表名时仍需反引号转义。维护 250+ 条版本相关的保留字黑名单成本
 /// 远高于收益（运维方极少如此命名），故不在本检查范围；示例配置注释已提示避免。
-fn is_valid_identifier(name: &str) -> bool {
+pub(crate) fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 校验 mapping 列声明的 SQL 类型（`type` 字段）是否安全可拼进 CREATE TABLE。
+///
+/// 与 `database.table` 同理，`type` 原样拼进 `--init` 生成的 DDL（见
+/// [`crate::sql_gen::col_type_to_sql`），故不能含任意字符。允许集合：字母/数字/下划线/
+/// 空格/圆括号/逗号——覆盖 `varchar(255)`/`int`/`double`/`decimal(10,2)`/`text`
+/// 等合法类型，排除引号/分号/反引号/注释序列(`--`/`#`/`/*`)等注入字符。
+fn is_safe_col_type(t: &str) -> bool {
+    if t.trim().is_empty() {
+        return false;
+    }
+    t.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == ')' || c == ',' || c == ' '
+    }) && !t.contains("--")
 }
 
 /// 配置错误(携带可读描述)。
@@ -407,12 +461,88 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     }
 
     let fixed = fixed_column_names();
+    // 固定列中由结构字段直接取值（ip/card_id/ts/source）的列名集合：
+    // 用户在 fields/expressions/host_fields 里配这些名字会写入 row.fields/strings，
+    // 但 sink 的 fixed_write_values 直接从结构字段取值（不查 map），故配置值会被
+    // 静默丢弃——这与"无静默数据损坏"原则相悖，必须在此拦截。
+    let structural_fixed: HashSet<&str> = ["id", "ts", "ip", "card_id", "source"]
+        .into_iter()
+        .collect();
+    // 可写的数值 / 字符串固定列名集合（与 sink::fixed_write_values 同一真相源）。
+    // 见 writable_numeric_columns / writable_string_columns 的文档：配置名必须落在
+    // 对应集合内，否则值写进 row 但 sink 按固定名读取 → 静默 NULL + 丢值，且
+    // schema 校验抓不到（expected_columns 不含这些名）。这是典型的"配置写错但无任何
+    // 提示"静默数据丢失，按"启动即失败"原则在此拦截。
+    let writable_numeric = writable_numeric_columns();
+    let writable_string = writable_string_columns();
+    let numeric_allowed = sorted_list(&writable_numeric);
+    let string_allowed = sorted_list(&writable_string);
 
     // 每个 source 的字段/表达式校验
     for (i, src) in cfg.sources.iter().enumerate() {
         if src.name.is_empty() {
             return Err(ConfigError(format!("sources[{}].name 不能为空", i)));
         }
+        if src.primary.metric.is_empty() {
+            return Err(ConfigError(format!(
+                "sources[{}]({}).primary.metric 不能为空",
+                i, src.name
+            )));
+        }
+        if src.primary.card_label.is_empty() {
+            return Err(ConfigError(format!(
+                "sources[{}]({}).primary.card_label 不能为空",
+                i, src.name
+            )));
+        }
+
+        // 跨类别重复名检测（R13）：fields[].name / expressions[].name /
+        // host_fields[].name 都会写入同一 row.fields（数值）或 row.strings（标签）。
+        // HashMap::insert 重名静默覆盖 → 后者覆盖前者 → 数据静默丢失，无任何提示。
+        // 在此收集全部"产出列名"，遇重名即报错。`from: label` 的字段写 strings，
+        // 其余写 fields，二者命名空间不同，故分开跟踪（但都不得撞结构固定列）。
+        let mut seen_numeric: HashSet<String> = HashSet::new();
+        let mut seen_string: HashSet<String> = HashSet::new();
+        // 注册一个"产出列名"。`allowed` 为该命名空间（数值/字符串）下允许的列名集合，
+        // `allowed_desc` 是其在错误信息里的可读清单。`kind` 标注来源（fields[N] 等）。
+        let register = |seen: &mut HashSet<String>,
+                        allowed: &HashSet<&str>,
+                        allowed_desc: &str,
+                        name: &str,
+                        kind: &str|
+         -> Result<(), ConfigError> {
+            if name.is_empty() {
+                return Err(ConfigError(format!(
+                    "sources[{}]({}): {} 的 name 不能为空",
+                    i, src.name, kind
+                )));
+            }
+            if structural_fixed.contains(name) {
+                return Err(ConfigError(format!(
+                    "sources[{}]({}): {} 的 name '{}' 与固定结构列冲突（该列由 ip/card_id/ts/source 字段直接取值，配置同名列会被静默丢弃）",
+                    i, src.name, kind, name
+                )));
+            }
+            // F1：name 必须落在"可写列"集合内。否则 extractor 把值写进 row（按 name 建键），
+            // 而 sink 的 fixed_write_values 只按 FIXED_COLUMNS 的固定名读取（不查 row），
+            // 配置的值永远不会被绑定 → 该列静默 NULL 且源值丢弃；schema 校验也抓不到
+            // （expected_columns 不含此名）。示例：把 gpu_util 误写成 utilization，
+            // 或多写一个不在表里的字段 → 整列永久 NULL、无任何提示。在此拦截。
+            if !allowed.contains(name) {
+                return Err(ConfigError(format!(
+                    "sources[{}]({}): {} 的 name '{}' 不是可写入的列；允许: {}（名称必须与表中固定列完全一致，否则值会被静默丢弃）",
+                    i, src.name, kind, name, allowed_desc
+                )));
+            }
+            if !seen.insert(name.to_string()) {
+                return Err(ConfigError(format!(
+                    "sources[{}]({}): {} 的 name '{}' 与同源其它字段/表达式/host_field 重名（HashMap 写入会静默覆盖 → 数据丢失）",
+                    i, src.name, kind, name
+                )));
+            }
+            Ok(())
+        };
+
         for (fi, fe) in src.fields.iter().enumerate() {
             // from 必须是已知枚举：extractor 用 match fc.from 消费，未知值走 `_ =>`
             // 静默跳过该字段（永远写不进表）。在此拦截，避免"配错字段名却无提示"。
@@ -428,14 +558,55 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     i, fi, fe.name
                 )));
             }
-        }
-        for ex in &src.expressions {
-            if !crate::expr::is_valid(&ex.expr) {
+            if fe.metric.is_empty() {
                 return Err(ConfigError(format!(
-                    "sources[{}].expressions[{}] 表达式语法错误: '{}'",
-                    i, ex.name, ex.expr
+                    "sources[{}].fields[{}]({}): metric 不能为空",
+                    i, fi, fe.name
                 )));
             }
+            // from=metric 写数值列；from=label 写字符串列。两者命名空间不同，
+            // 用各自的允许集合校验。
+            if fe.from == "metric" {
+                register(
+                    &mut seen_numeric,
+                    &writable_numeric,
+                    &numeric_allowed,
+                    &fe.name,
+                    &format!("fields[{}]", fi),
+                )?;
+            } else {
+                register(
+                    &mut seen_string,
+                    &writable_string,
+                    &string_allowed,
+                    &fe.name,
+                    &format!("fields[{}]", fi),
+                )?;
+            }
+        }
+        for (ei, ex) in src.expressions.iter().enumerate() {
+            if !crate::expr::is_valid(&ex.expr) {
+                return Err(ConfigError(format!(
+                    "sources[{}].expressions[{}]({}) 表达式语法错误: '{}'",
+                    i, ex.name, ei, ex.expr
+                )));
+            }
+            register(
+                &mut seen_numeric,
+                &writable_numeric,
+                &numeric_allowed,
+                &ex.name,
+                &format!("expressions[{}]", ei),
+            )?;
+        }
+        for (hi, hf) in src.host_fields.iter().enumerate() {
+            register(
+                &mut seen_numeric,
+                &writable_numeric,
+                &numeric_allowed,
+                &hf.name,
+                &format!("host_fields[{}]", hi),
+            )?;
         }
     }
 
@@ -451,6 +622,24 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                 return Err(ConfigError(format!(
                     "mapping.sources[{}].columns[{}]: 最终列名 '{}' 与其它 mapping 列重复",
                     si, ci, final_name
+                )));
+            }
+            // R14：mapping 最终列名被**原样拼接**进 INSERT 列表与 CREATE TABLE 列定义
+            // （裸标识符插值，无法参数化），与 database.table 同性质。含连字符/空格/
+            // 引号的名字会在运行期产生模糊 MySQL 语法错误而非启动期清晰提示，且构成
+            // 注入面。与 table 用同一套 is_valid_identifier 校验，保持一致原则。
+            if !is_valid_identifier(&final_name) {
+                return Err(ConfigError(format!(
+                    "mapping.sources[{}].columns[{}]: 最终列名 '{}' 非法：须为 MySQL 合法标识符 [A-Za-z_][A-Za-z0-9_]*（勿用连字符/空格/引号/保留字）",
+                    si, ci, final_name
+                )));
+            }
+            // R14：列类型(col_type)同样原样拼进 CREATE TABLE（见 sql_gen::col_type_to_sql），
+            // 必须限定为安全字符集，排除引号/分号/注释序列等注入字符。
+            if !is_safe_col_type(&col.col_type) {
+                return Err(ConfigError(format!(
+                    "mapping.sources[{}].columns[{}]({}): type '{}' 非法：仅允许字母/数字/下划线/空格/圆括号/逗号（如 varchar(255)/int/double/decimal(10,2)），禁止引号/分号/注释序列",
+                    si, ci, final_name, col.col_type
                 )));
             }
             all_mapping_names.insert(final_name);
@@ -677,15 +866,107 @@ sources:
         assert!(validate(&cfg).is_err());
     }
 
-    /// 守护：合法 from 值不误伤（metric/label 均应通过）。
+    /// 守护：合法 from 值不误伤（metric/label 均应通过）。注意 from=label 的字段名
+    /// 必须是可写字符串列（namespace/pod），否则会被 F1 白名单拦截（设计如此）。
     #[test]
     fn accepts_valid_field_from() {
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
+            "{ name: \"namespace\", from: \"label\", metric: \"m1\", label: \"ns\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_ok());
+    }
+
+    // ===== F1 守护测试（可写列白名单） =====
+
+    /// 守护 F1：from=metric 的字段名若不是可写数值列（gpu_util/mem_util/temp/power/
+    /// host_cpu/host_mem/host_fds），值会写进 row.fields 但 sink 按固定名读取 → 静默
+    /// NULL + 丢值，且 schema 校验抓不到。必须启动期拦截。例：把 gpu_util 误写成
+    /// utilization（运维极易犯的错）。
+    #[test]
+    fn rejects_field_name_not_in_writable_numeric_columns() {
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
+            "{ name: \"utilization\", from: \"metric\", metric: \"m1\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(
+            validate(&cfg).is_err(),
+            "非可写数值列名 'utilization' 应被拒绝"
+        );
+    }
+
+    /// 守护 F1：表达式（expressions）的 name 同样必须在可写数值列集合内。
+    /// 例：把 mem_util 表达式误命名为 mem_usage → 静默 NULL。
+    #[test]
+    fn rejects_expression_name_not_in_writable_numeric_columns() {
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"mem_util\", expr: \"a / b\" }",
+            "{ name: \"mem_usage\", expr: \"a / b\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(
+            validate(&cfg).is_err(),
+            "非可写数值列名 'mem_usage' 应被拒绝"
+        );
+    }
+
+    /// 守护 F1：host_fields 的 name 必须在可写数值列集合内（host_cpu/host_mem/host_fds）。
+    #[test]
+    fn rejects_host_field_name_not_in_writable_numeric_columns() {
+        // 基础 yaml 无 host_fields，注入一个非法名的。
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "primary: { metric: \"m1\", card_label: \"gpu\" }\n    host_fields:\n      - { name: \"host_uptime\", expr: \"node_uptime\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(
+            validate(&cfg).is_err(),
+            "非可写数值列名 'host_uptime' 应被拒绝"
+        );
+    }
+
+    /// 守护 F1：from=label 的字段名必须是可写字符串列（namespace/pod）。
+    /// 例：把 namespace 字段误命名为 ns → 静默丢值。
+    #[test]
+    fn rejects_label_field_name_not_in_writable_string_columns() {
         let yaml = valid_base_yaml().replace(
             "{ name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
             "{ name: \"ns\", from: \"label\", metric: \"m1\", label: \"ns\" }",
         );
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert!(validate(&cfg).is_ok());
+        assert!(
+            validate(&cfg).is_err(),
+            "非可写字符串列名 'ns' 应被拒绝（仅允许 namespace/pod）"
+        );
+    }
+
+    /// 守护 F1：合法的 host_fields（host_cpu/host_mem/host_fds）不应被误伤。
+    #[test]
+    fn accepts_valid_host_field_names() {
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "primary: { metric: \"m1\", card_label: \"gpu\" }\n    host_fields:\n      - { name: \"host_cpu\", expr: \"node_cpu\" }\n      - { name: \"host_mem\", expr: \"node_mem\" }\n      - { name: \"host_fds\", expr: \"node_fds\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_ok(), "合法 host_field 名不应被误伤");
+    }
+
+    /// 守护 F1：错误信息应包含允许的列名清单，便于运维定位（不只是"非法"）。
+    #[test]
+    fn f1_error_message_lists_allowed_columns() {
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
+            "{ name: \"utilization\", from: \"metric\", metric: \"m1\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        let err = validate(&cfg).unwrap_err().0;
+        assert!(
+            err.contains("gpu_util"),
+            "错误信息应列出允许的数值列名，实际: {}",
+            err
+        );
     }
 
     /// 守护：logging.level 枚举校验。拼错（如 "erorr"）不应静默退化。
@@ -799,5 +1080,99 @@ sources:
         let cfg: Config = serde_yaml::from_str(EXAMPLE_CONFIG)
             .expect("config.example.yaml 解析失败，请检查语法");
         validate(&cfg).expect("config.example.yaml 校验失败，请检查字段");
+    }
+
+    // ===== R13-R14、R20 守护测试（本轮新增） =====
+
+    /// 守护 R13：两个同名字段会被静默覆盖（HashMap.insert），必须在启动期拒绝。
+    #[test]
+    fn rejects_duplicate_field_names() {
+        let yaml = valid_base_yaml().replace(
+            "fields:\n      - { name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
+            "fields:\n      - { name: \"gpu_util\", from: \"metric\", metric: \"m1\" }\n      - { name: \"gpu_util\", from: \"metric\", metric: \"m2\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "同名字段应被拒绝");
+    }
+
+    /// 守护 R13：字段名与表达式名相同 → 后者覆盖前者，必须拒绝。
+    #[test]
+    fn rejects_field_expression_name_collision() {
+        // 基础 yaml 已有字段 gpu_util 和表达式 mem_util；把表达式名也改成 gpu_util。
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"mem_util\", expr: \"a / b\" }",
+            "{ name: \"gpu_util\", expr: \"a / b\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "字段与表达式同名应被拒绝");
+    }
+
+    /// 守护 R13：字段名撞结构固定列（如 ip）→ 配置值会被 sink 的 fixed_write_values
+    /// 静默丢弃（它直接从结构字段取值），必须拒绝。
+    #[test]
+    fn rejects_field_name_colliding_with_structural_column() {
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
+            "{ name: \"ip\", from: \"metric\", metric: \"m1\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "字段名撞结构固定列(ip)应被拒绝");
+    }
+
+    /// 守护 R20：空 primary.metric / card_label / 字段 metric 应被拒绝（非空校验）。
+    #[test]
+    fn rejects_empty_primary_metric_and_card_label() {
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "primary: { metric: \"\", card_label: \"gpu\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "空 primary.metric 应被拒绝");
+
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "primary: { metric: \"m1\", card_label: \"\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "空 primary.card_label 应被拒绝");
+    }
+
+    /// 守护 R14：mapping 最终列名含非法字符（连字符/空格/引号）会被原样拼进
+    /// CREATE TABLE / INSERT，必须在启动期按标识符字符集拦截（与 table 同标准）。
+    #[test]
+    fn rejects_mapping_name_with_injection_chars() {
+        let base = valid_base_yaml();
+        for bad in ["loc-x", "loc x", "loc';DROP--"] {
+            let yaml = format!(
+                "{base}\nmapping:\n  enabled: true\n  sources:\n    - source_path: \"./a.csv\"\n      src_key: \"namespace\"\n      dest_key: \"Namespace\"\n      columns:\n        - source_field: \"x\"\n          rename: \"{bad}\"\n          type: \"varchar(64)\"\n          comment: \"c\"\n          position: {{ direction: after, anchor: \"namespace\" }}",
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(validate(&cfg).is_err(), "非法 mapping 列名 {:?} 应被拒绝", bad);
+        }
+    }
+
+    /// 守护 R14：mapping 列类型(type)含注入字符（引号/分号/注释序列）会被原样拼进
+    /// CREATE TABLE，必须按白名单字符集拦截。
+    #[test]
+    fn rejects_mapping_type_with_injection_chars() {
+        let base = valid_base_yaml();
+        for bad in ["varchar(64); DROP TABLE t; --", "int' OR '1'='1", "text#abc"] {
+            let yaml = format!(
+                "{base}\nmapping:\n  enabled: true\n  sources:\n    - source_path: \"./a.csv\"\n      src_key: \"namespace\"\n      dest_key: \"Namespace\"\n      columns:\n        - source_field: \"x\"\n          rename: \"loc\"\n          type: \"{bad}\"\n          comment: \"c\"\n          position: {{ direction: after, anchor: \"namespace\" }}",
+            );
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(validate(&cfg).is_err(), "非法 mapping 列类型 {:?} 应被拒绝", bad);
+        }
+    }
+
+    /// 守护 R14：合法 mapping 列名与类型不误伤（下划线/数字/带长度的 decimal 均合法）。
+    #[test]
+    fn accepts_valid_mapping_name_and_type() {
+        let base = valid_base_yaml();
+        let yaml = format!(
+            "{base}\nmapping:\n  enabled: true\n  sources:\n    - source_path: \"./a.csv\"\n      src_key: \"namespace\"\n      dest_key: \"Namespace\"\n      columns:\n        - source_field: \"x\"\n          rename: \"owner_1\"\n          type: \"decimal(10,2)\"\n          comment: \"c\"\n          position: {{ direction: after, anchor: \"namespace\" }}",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_ok(), "合法 mapping 列名/类型不应被误伤");
     }
 }

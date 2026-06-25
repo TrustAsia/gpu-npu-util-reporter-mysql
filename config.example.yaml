@@ -97,7 +97,6 @@ sources:
     expressions:
       - name: "mem_util"
         expr: "DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)"
-        unit: "%"
     host_fields:
       - name: "host_cpu"
         expr: '100 - (avg by(instance)(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)'

@@ -128,7 +128,6 @@ async fn expression_evaluates_per_card() {
         expressions: vec![gpu_npu_util_reporter_mysql::config::ExprConfig {
             name: "mem_util".into(),
             expr: "FB_USED / (FB_USED + FB_FREE)".into(),
-            unit: Some("%".into()),
         }],
         host_fields: vec![],
     };

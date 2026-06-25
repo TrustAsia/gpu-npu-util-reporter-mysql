@@ -210,9 +210,14 @@ async fn main() {
     tracing::info!("收到退出信号，等待当前轮采集/写入完成...");
     shutdown.store(true, std::sync::atomic::Ordering::Release);
     // 等待各任务在轮次边界自行退出（而非 abort 打断写入）。
+    // 显式处理 JoinError：若某采集任务 panic（理论上不应发生——所有路径都用了
+    // `Result`/软失败），其 JoinHandle 返回 Err(JoinError)。旧代码 `let _ = h.await`
+    // 会静默丢弃，该源就此静默停采且日志里无任何痕迹——违背"无静默数据丢失"。
+    // 在此记录 ERROR，让运维能从日志发现"某源任务异常退出"。
     for h in handles {
-        // 等待结果，忽略 JoinError（任务已正常返回）。
-        let _ = h.await;
+        if let Err(e) = h.await {
+            tracing::error!(error = %e, "采集/清理任务异常退出（panic）；该源可能已停止采集，请检查日志");
+        }
     }
     log_handle.abort();
     tracing::info!("已优雅退出");
@@ -276,6 +281,19 @@ struct CachedAppendFile {
     cached: Mutex<Option<(chrono::NaiveDate, Arc<Mutex<std::fs::File>>)>>,
 }
 
+/// 加锁并从可能的中毒状态恢复（F2）。
+///
+/// 日志路径上所有 `Mutex` 都用本函数而非 `.lock().unwrap()`：一旦某次写文件 panic
+/// 导致 Mutex 中毒，`.unwrap()` 会再次 panic，而 tracing-subscriber 在 writer panic 时
+/// 默认**禁用该日志层**——文件日志从此静默永久失效，且无任何重启信号。日志是本程序
+/// 唯一的可观测性出口，不能成为单点。
+///
+/// 受保护的数据（文件句柄、目录已建标记）在 panic 后访问并无内存安全问题
+/// （文件 I/O 错误会以 `io::Result::Err` 正常返回），故用 `into_inner()` 取出内部值继续。
+fn lock_or_recover<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl CachedAppendFile {
     fn new(dir: String, base: String, tz: chrono_tz::Tz) -> Self {
         Self {
@@ -290,7 +308,7 @@ impl CachedAppendFile {
     /// 文件打不开时返回 None（调用方退化为丢弃日志，避免日志拖垮采集）。
     fn handle(&self) -> Option<Arc<Mutex<std::fs::File>>> {
         let today = chrono::Utc::now().with_timezone(&self.tz).date_naive();
-        let mut slot = self.cached.lock().unwrap();
+        let mut slot = lock_or_recover(&self.cached);
         let needs_open = match slot.as_ref() {
             None => true,
             Some((d, _)) => *d != today,
@@ -327,7 +345,7 @@ struct DailyFileWriter {
 impl DailyFileWriter {
     /// 确保日志目录存在（惰性创建一次）。
     fn ensure_dir(&self) {
-        let mut ready = self.dir_ready.lock().unwrap();
+        let mut ready = lock_or_recover(&self.dir_ready);
         if *ready {
             return;
         }
@@ -379,16 +397,18 @@ impl TeeWriter {
 
 impl Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.all.lock().unwrap().write(buf)?;
+        // 用 lock_or_recover 而非 .lock().unwrap()（F2）：避免 Mutex 中毒让日志层
+        // 永久失效。文件句柄中毒后仍可安全访问（I/O 错误以 Err 返回）。
+        let n = lock_or_recover(&self.all).write(buf)?;
         if let Some(e) = self.err.as_ref() {
-            let _ = e.lock().unwrap().write_all(buf);
+            let _ = lock_or_recover(e).write_all(buf);
         }
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.all.lock().unwrap().flush()?;
+        lock_or_recover(&self.all).flush()?;
         if let Some(e) = self.err.as_ref() {
-            let _ = e.lock().unwrap().flush();
+            let _ = lock_or_recover(e).flush();
         }
         Ok(())
     }

@@ -85,6 +85,28 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         .map(|(m, s)| (m.clone(), align::index_labels_by_key(s, &align_labels)))
         .collect();
 
+    // 可观测性（R-minor）：主指标枚举的卡集 与 某所需 metric 实际返回的卡集，
+    // 若二者**零交集**，则该 metric 的逐卡对齐查找会全部落空 → 该字段对所有卡永远
+    // 写 NULL，且无任何提示。这是"静默数据丢失"的典型（如 exporter 对次指标用 "00"
+    // 零填充而主指标用 "0"，或 metric 名拼错导致查到无关序列）。逐 metric 比对键集，
+    // 零交集时记 WARN 让运维可定位。键集非空但部分缺失属正常（某张卡缺温度），不告警。
+    let primary_keys: HashSet<String> = primary_samples
+        .iter()
+        .map(|s| align::make_key(&s.labels, &align_labels))
+        .collect();
+    for (m, keys) in &value_idx {
+        if keys.is_empty() {
+            continue;
+        }
+        let any_overlap = keys.keys().any(|k| primary_keys.contains(k));
+        if !any_overlap {
+            tracing::warn!(
+                metric = %m,
+                "该 metric 的卡片键集与主指标零交集，其字段将全部写 NULL（检查 card_label 值是否一致，如 \"0\" vs \"00\"，或 metric 名是否拼错）"
+            );
+        }
+    }
+
     // 3. 主机级字段（整主机单值）：每个 host_field 查一次，取首条序列的值。
     //    单个 host_field 查询失败只让该字段本轮写 NULL（WARN），不连累整个 source
     //    （与逐卡字段缺失的软失败语义一致；否则抖动的 host_cpu 查询会丢掉全部卡数据）。

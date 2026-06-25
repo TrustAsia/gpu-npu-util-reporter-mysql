@@ -5,7 +5,7 @@
 # =====================================================================
 [package]
 name = "gpu-npu-util-reporter-mysql"
-version = "0.16.0"
+version = "0.17.1"
 edition = "2021"
 description = "定时从多个 Prometheus 服务器读取 GPU/NPU 及主机指标，按卡片维度对齐后写入 MySQL"
 
@@ -34,8 +34,6 @@ clap = { version = "4", features = ["derive"] }
 # 时间处理 + 时区
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
-# 错误类型派生
-thiserror = "1"
 # 正则：提取表达式中的变量名(metric 名)
 regex = "1"
 # async trait：为 extractor 抽象可 mock 的查询接口

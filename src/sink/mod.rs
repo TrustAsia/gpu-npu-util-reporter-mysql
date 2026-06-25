@@ -79,8 +79,13 @@ impl Sink {
 
     /// 写入采集行（固定列 + mapping 列动态拼入）。
     ///
-    /// 采用**逐行 INSERT**而非单条多 VALUES 批量：单行失败不影响同批其它行
-    /// （失败隔离优先于吞吐；一轮通常仅几十行，逐行往返开销可接受）。
+    /// 采用**逐行 INSERT**而非单条多 VALUES 批量，且**单行失败不中断**：某行 INSERT
+    /// 失败时记 ERROR 并跳过该行继续写其余行（失败隔离优先于全批回滚）。
+    ///
+    /// 这是有意的语义选择：MySQL 抖动/单行违规（如超长值在严格模式下被拒）只应丢该行，
+    /// 不应让同批其余几十行一并丢失。返回值为**成功写入**的行数（可能 < 入参行数）。
+    /// 若调用方需"全批原子"，应自行在外层用事务包裹——但本采集场景下"部分成功"
+    /// 优于"全丢"（一轮通常仅几十行，单行失败极少）。
     ///
     /// `mapping_cols` 为该批次要写入的 mapping 列名（最终名）列表，按此顺序绑定。
     /// 每个值从 `row.strings` 取；缺失则写 NULL。
@@ -112,6 +117,7 @@ impl Sink {
             placeholders.join(", ")
         );
 
+        let mut written: u64 = 0;
         for row in rows {
             // 固定列值：与 fixed_names 完全相同的顺序产出（见 fixed_write_values）。
             // 列名顺序与取值顺序都由 FIXED_COLUMNS 单一真相源驱动。
@@ -127,11 +133,21 @@ impl Sink {
             for mc in mapping_cols {
                 q = q.bind(row.strings.get(mc).cloned().flatten());
             }
-            q.execute(&self.pool)
-                .await
-                .map_err(|e| SinkError(format!("INSERT 失败: {}", e)))?;
+            match q.execute(&self.pool).await {
+                Ok(_) => written += 1,
+                // 单行失败：记 ERROR 跳过该行继续（失败隔离），而非 `?` 中断整批。
+                // 中断会让"一行违规/抖动 → 同批其余行全丢"，与逐行 INSERT 的初衷相悖。
+                Err(e) => tracing::error!(
+                    target: "sink",
+                    ip = %row.ip,
+                    card_id = %row.card_id,
+                    source = %row.source,
+                    error = %e,
+                    "单行 INSERT 失败，跳过该行继续写其余行（失败隔离）"
+                ),
+            }
         }
-        Ok(rows.len() as u64)
+        Ok(written)
     }
 
     /// 执行保留期清理，返回删除行数。

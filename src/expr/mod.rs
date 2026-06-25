@@ -25,6 +25,13 @@
 //! ```
 //! 变量名匹配 `[A-Za-z_][A-Za-z0-9_]*`（与 Prometheus metric 名规则一致，
 //! 如 `DCGM_FI_DEV_FB_USED`）。
+//!
+//! **已知限制**：Prometheus 的 recording-rule 输出名允许含 `:`（如 `job:gpu_util:ratio`），
+//! 但本解析器的变量名字符集不含 `:`，故这类名无法在表达式中使用。这是**有意的范围限定**
+//! （DCGM/NPU exporter 的原始 metric 名均不含 `:`），并非缺陷——配置校验会在启动期
+//! 对含 `:` 的表达式报 ParseError（parse_var 在 `:` 处停止 → 尾部残留 → 报错），即
+//! 不会静默吞掉。如未来需支持 colon 名，须同步放宽此处的字符集与 [`extract_var_names`]
+//! （src/extractor）的正则。
 
 use std::collections::HashMap;
 

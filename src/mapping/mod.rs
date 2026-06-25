@@ -50,6 +50,25 @@ impl AssetIndex {
 /// 行 = HashMap<列名, 字符串值>。CSV 与 Excel 统一转成这种结构。
 type RowMap = HashMap<String, String>;
 
+/// 规范化关联键：去 UTF-8 BOM、去首尾空白。
+///
+/// 资产表常由 Excel 导出（带 BOM、单元格前后残留空格），采集行内键来自 Prometheus
+/// 标签（无 BOM/通常无首尾空格）。若不规范化，`" prod "`≠`"prod"`、
+/// `"\u{FEFF}default"`≠`"default"` 会导致整列静默 NULL——违背"无静默数据损坏"原则。
+/// 索引侧（load_source）与行内键侧（join_row）都用本函数，保持对称。
+fn normalize_key(v: &str) -> String {
+    v.strip_prefix('\u{FEFF}')
+        .unwrap_or(v)
+        .trim()
+        .to_string()
+}
+
+/// 去掉首个表头单元格可能的 UTF-8 BOM（Excel/Windows 默认带 BOM，
+/// 会导致首个表头名变成 `"\u{FEFF}Namespace"`，与配置的 dest_key 不匹配 → 静默全 NULL）。
+fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{FEFF}').unwrap_or(s)
+}
+
 /// 从单个 [`MappingSource`] 加载为 [`AssetIndex`]。
 ///
 /// 读取 CSV 或 Excel（按扩展名判断），取表头列名，逐行构造 RowMap，
@@ -67,9 +86,14 @@ pub fn load_source(ms: &MappingSource) -> Result<AssetIndex, MappingError> {
     };
 
     // 建 dest_key 索引：同一 key 仅保留首条（多匹配取首条规则）。
+    // key 经规范化（去 BOM/首尾空白）后再建索引，与 join_row 侧的行内键规范化对称，
+    // 避免 " prod "≠"prod"、"\u{FEFF}Namespace"≠"Namespace" 等导致的静默全 NULL。
     let mut map: HashMap<String, HashMap<String, String>> = HashMap::new();
     for row in &rows {
-        let key = row.get(&ms.dest_key).cloned().unwrap_or_default();
+        let key = row
+            .get(&ms.dest_key)
+            .map(|v| normalize_key(v))
+            .unwrap_or_default();
         if key.is_empty() {
             continue;
         }
@@ -94,10 +118,14 @@ fn read_csv(ms: &MappingSource) -> Result<Vec<RowMap>, MappingError> {
         .map_err(|e| MappingError(format!("打开 CSV 失败: {}", e)))?;
     let headers = rdr
         .headers()
-        .map_err(|e| MappingError(format!("读 CSV 表头失败: {}", e)))?
+        .map_err(|e| MappingError(format!("读 CSV 表头失败: {}", e)))?;
+    // 首个表头单元格去 BOM（Excel/Windows 导出的 CSV 默认带 UTF-8 BOM，
+    // 否则首个表头名形如 "\u{FEFF}Namespace"，与配置 dest_key 不匹配 → 全 NULL）。
+    let headers: Vec<String> = headers
         .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+        .enumerate()
+        .map(|(i, s)| if i == 0 { strip_bom(s) } else { s }.to_string())
+        .collect();
     let mut out = Vec::new();
     for rec in rdr.records() {
         let rec = rec.map_err(|e| MappingError(format!("读 CSV 行失败: {}", e)))?;
@@ -126,7 +154,12 @@ fn read_xlsx(ms: &MappingSource) -> Result<Vec<RowMap>, MappingError> {
     let header = rows_iter
         .next()
         .ok_or_else(|| MappingError("Excel 表头为空".into()))?;
-    let headers: Vec<String> = header.iter().map(|c| c.to_string()).collect();
+    // 首个表头去 BOM（与 read_csv 对称；xlsx 理论上少有 BOM，但统一处理无害）。
+    let mut headers: Vec<String> = Vec::with_capacity(header.len());
+    for (i, c) in header.iter().enumerate() {
+        let s = c.to_string();
+        headers.push(if i == 0 { strip_bom(&s).to_string() } else { s });
+    }
     let mut out = Vec::new();
     for row in rows_iter {
         let mut r: RowMap = HashMap::new();
@@ -146,9 +179,20 @@ pub fn load_all(cfg: &MappingConfig) -> Result<Vec<AssetIndex>, MappingError> {
 }
 
 /// 判断配置的列类型是否为数值类型（影响 join 时是否尝试解析为数字）。
+///
+/// 需与 [`crate::sql_gen`] 的类型识别保持一致：`col_type_to_sql` 把 `int`/`bigint`/
+/// `double`/`float` 归为数值，故此处也覆盖 MySQL 的全部整数类型
+/// （`tinyint`/`smallint`/`mediumint`/`int`/`bigint`）与浮点/定点（`float`/`double`/
+/// `decimal`）。否则一个声明为 `bigint` 的列若值脏（非数字），不会被此处的解析检查
+/// 拦下（→ 列级 NULL + warning），而是被原样透传给 MySQL，在 `STRICT_TRANS_TABLES` 下
+/// 导致**整行** INSERT 失败被丢弃——与 `int` 列的"列级软失败"语义不一致。
 fn is_numeric_type(col_type: &str) -> bool {
     let lower = col_type.trim().to_lowercase();
     lower.starts_with("int")
+        || lower.starts_with("bigint")
+        || lower.starts_with("tinyint")
+        || lower.starts_with("smallint")
+        || lower.starts_with("mediumint")
         || lower.starts_with("double")
         || lower.starts_with("float")
         || lower.starts_with("decimal")
@@ -180,6 +224,7 @@ pub fn join_row(
             .get(src_key)
             .cloned()
             .flatten()
+            .map(|v| normalize_key(&v))
             .unwrap_or_default();
         let matched = index.lookup(&key_value);
         for col_name in index.column_names() {
@@ -349,5 +394,28 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("loc_int"));
         assert_eq!(row.strings.get("loc_int").unwrap(), &None);
+    }
+
+    /// 守护 F5：is_numeric_type 须覆盖 MySQL 全部整数类型（bigint/tinyint/smallint/
+    /// mediumint），与 sql_gen::col_type_to_sql 保持一致。否则 bigint 列的脏值不会被
+    /// 列级解析拦截（→ 整行 INSERT 失败被丢），与 int 列的"列级 NULL+warning"语义分裂。
+    #[test]
+    fn is_numeric_type_covers_all_mysql_integers() {
+        // 整数族（F5 重点）。
+        assert!(is_numeric_type("int"));
+        assert!(is_numeric_type("bigint"));
+        assert!(is_numeric_type("tinyint"));
+        assert!(is_numeric_type("smallint"));
+        assert!(is_numeric_type("mediumint"));
+        // 浮点/定点（原有覆盖，不应回归）。
+        assert!(is_numeric_type("double"));
+        assert!(is_numeric_type("float"));
+        assert!(is_numeric_type("decimal(10,2)"));
+        assert!(is_numeric_type("INT"));
+        assert!(is_numeric_type(" BIGINT ")); // 含空白与大小写
+        // 非数值类型不应误判。
+        assert!(!is_numeric_type("varchar(255)"));
+        assert!(!is_numeric_type("text"));
+        assert!(!is_numeric_type("datetime"));
     }
 }

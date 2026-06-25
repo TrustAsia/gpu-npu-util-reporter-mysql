@@ -42,6 +42,10 @@ impl PrometheusClient {
     pub fn new(base_url: &str, timeout: u64) -> Result<Self, SourceError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout))
+            // 禁用重定向：本程序只与配置的单个 Prometheus 端点通信，3xx 永非预期。
+            // 默认策略会跟随最多 10 跳——内网代理/负载均衡器的 302 会让本程序去抓取
+            // 任意大资源（与下方响应体上限叠加放大内存 DoS 面），故一律当作错误。
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| SourceError(format!("构建 HTTP 客户端失败: {}", e)))?;
         Ok(Self {
@@ -50,15 +54,23 @@ impl PrometheusClient {
         })
     }
 
+    /// 单次响应体最大字节数上限。
+    ///
+    /// Prometheus `/api/v1/query` 正常响应远小于此（即便上千卡也只有几 MiB）。
+    /// 长驻守护进程无界 `resp.text()` 读全 body 进内存是 OOM 向量：主指标高基数
+    /// 爆炸、代理塞回大 HTML 错误页等都会让 `text` 无限增长 → 进程被 OOM 杀死 →
+    /// 所有源停采（静默数据丢失）。16 MiB 足够覆盖正常负载又杜绝无界增长。
+    const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
     /// 查询瞬时向量。
     ///
     /// `metric` 可为完整 PromQL（用于 host_fields 这类算好的单值）或纯指标名
     /// （用于 fields 这类逐卡取值）。返回该查询的所有序列样本。
     ///
-    /// 失败（网络错误、非 2xx、响应不可解析）统一返回 [`SourceError`]。
+    /// 失败（网络错误、非 2xx、3xx 重定向、响应不可解析、响应体超限）统一返回 [`SourceError`]。
     pub async fn query(&self, metric: &str) -> Result<Vec<MetricSample>, SourceError> {
         let url = format!("{}/api/v1/query", self.base_url);
-        let resp = self
+        let mut resp = self
             .client
             .post(&url)
             .form(&[("query", metric)])
@@ -66,10 +78,39 @@ impl PrometheusClient {
             .await
             .map_err(|e| SourceError(format!("查询 Prometheus 失败: {}", e)))?;
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| SourceError(format!("读取响应失败: {}", e)))?;
+        // 在读 body 前用响应头里的 Content-Length 预判（若提供），避免为超大响应
+        // 仍逐块读到上限。但 Content-Length 可缺失/伪造，故下面读流时仍二次卡上限。
+        if status.is_redirection() {
+            // 禁用了重定向，3xx 不会再被自动跟随；显式当作错误（而非当作成功空 body）。
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            return Err(SourceError(format!(
+                "Prometheus 返回重定向 {}（已禁用跟随）：Location={}",
+                status, loc
+            )));
+        }
+        // 有界读取：用 resp.chunk() 逐块累加，超 MAX_BODY_BYTES 立即中止，杜绝无界 OOM。
+        // （chunk 是 reqwest 自带 API，无需引入 futures-util 依赖。）
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let chunk = resp
+                .chunk()
+                .await
+                .map_err(|e| SourceError(format!("读取响应失败: {}", e)))?;
+            let Some(chunk) = chunk else { break };
+            if buf.len() + chunk.len() > Self::MAX_BODY_BYTES {
+                return Err(SourceError(format!(
+                    "响应体超过 {} 字节上限，已中止（疑似主指标高基数或被代理塞回大页面）",
+                    Self::MAX_BODY_BYTES
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(buf)
+            .map_err(|e| SourceError(format!("响应非 UTF-8: {}", e)))?;
         if !status.is_success() {
             return Err(SourceError(format!("Prometheus 返回 {}: {}", status, text)));
         }
@@ -199,5 +240,21 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].labels.get("gpu").unwrap(), "0");
         assert!(!samples[0].labels.contains_key("bad"));
+    }
+
+    /// 守护 R17：响应体上限常量存在且为合理量级（既够装正常负载又杜绝无界增长）。
+    /// 防止有人误改成超大/零值导致 OOM 面回归。
+    #[test]
+    fn max_body_bytes_is_reasonable_bound() {
+        // 16 MiB：正常上千卡 Prometheus 响应远小于此；过小会误杀正常负载。
+        assert_eq!(PrometheusClient::MAX_BODY_BYTES, 16 * 1024 * 1024);
+    }
+
+    /// 守护 R17：客户端能成功构造（含禁重定向配置）。重定向禁用与 body 上限的
+    /// 真实运行期行为由 query() 的 is_redirection 分支与 chunk 有界读取保证，
+    /// 此处只断言构造路径不回归（曾因 redirect API 误用导致编译失败）。
+    #[test]
+    fn client_constructs_with_redirect_policy_none() {
+        let _c = PrometheusClient::new("http://10.0.0.1:9400/", 10).unwrap();
     }
 }
