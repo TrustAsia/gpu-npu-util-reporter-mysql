@@ -161,10 +161,21 @@ pub fn expected_columns(cfg: &Config) -> HashSet<String> {
 enum ColVal {
     /// DATETIME 列（ts）。
     Time(chrono::NaiveDateTime),
-    /// VARCHAR 列（ip/card_id/namespace/pod/source）；None 写 NULL。
+    /// VARCHAR 列（ip/card_id/namespace/pod/source)；None 写 NULL。
     Str(Option<String>),
     /// DOUBLE 列（各数值字段）；None 写 NULL。
     F64(Option<f64>),
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for ColVal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColVal::Time(t) => f.debug_tuple("Time").field(t).finish(),
+            ColVal::Str(s) => f.debug_tuple("Str").field(s).finish(),
+            ColVal::F64(v) => f.debug_tuple("F64").field(v).finish(),
+        }
+    }
 }
 
 /// 按 [`crate::config::FIXED_COLUMNS`]（排除自增 `id`）的**同一顺序**产出各行固定列的值。
@@ -203,34 +214,36 @@ mod tests {
     /// 守护测试：[`fixed_write_values`] 产出的值序列，其顺序必须与
     /// [`crate::config::FIXED_COLUMNS`] 去掉自增 `id` 后的列顺序**逐项一致**。
     ///
-    /// 这是防止"写串列"的关键回归测试——SQL 列名与绑定值都从 FIXED_COLUMNS 派生，
-    /// 若有人手改了 [`fixed_write_values`] 的顺序而忘记同步（或反之），此测试会失败。
-    /// 由于 [`ColVal`] 不携带列名，这里按"固定列里哪些是数值/字符串/时间"与
-    /// FIXED_COLUMNS 的类型声明交叉验证：对每个非 id 固定列，确认对应位置的
-    /// `ColVal` 变体与其 SQL 类型相符。
+    /// 这是防止"写串列"的关键回归测试。关键点：给**每个**数值列赋一个唯一可辨识的
+    /// 值（编码进整数位：gpu_util=101.0、mem_util=102.0…），每个字符串列赋唯一串，
+    /// 再逐位置断言"第 i 个值 == 第 i 个列名所应得的值"。这样**同类型的相邻列互换
+    /// 也能被捕获**（仅校验类型变体无法发现两个 DOUBLE 列互换）。
     #[test]
     fn fixed_values_order_matches_fixed_columns() {
+        // 每个数值列给一个唯一标识值，编码方式：列序号 +100。
+        // strings 列也各给唯一串。
         let row = Row {
             ts: chrono::Utc::now().with_timezone(&Shanghai),
-            ip: "1.1.1.1".into(),
-            card_id: "0".into(),
+            ip: "IP-VALUE".into(),
+            card_id: "CARD-VALUE".into(),
             fields: HashMap::from([
-                ("gpu_util".into(), Some(1.0)),
-                ("mem_util".into(), Some(2.0)),
-                ("temp".into(), Some(3.0)),
-                ("power".into(), Some(4.0)),
-                ("host_cpu".into(), Some(5.0)),
-                ("host_mem".into(), Some(6.0)),
-                ("host_fds".into(), Some(7.0)),
+                ("gpu_util".into(), Some(101.0)),
+                ("mem_util".into(), Some(102.0)),
+                ("temp".into(), Some(103.0)),
+                ("power".into(), Some(104.0)),
+                ("host_cpu".into(), Some(105.0)),
+                ("host_mem".into(), Some(106.0)),
+                ("host_fds".into(), Some(107.0)),
             ]),
             strings: HashMap::from([
-                ("namespace".into(), Some("ns".into())),
-                ("pod".into(), Some("p".into())),
+                ("namespace".into(), Some("NS-VALUE".into())),
+                ("pod".into(), Some("POD-VALUE".into())),
             ]),
-            source: "s1".into(),
+            source: "SRC-VALUE".into(),
         };
         let vals = fixed_write_values(&row);
-        // 期望列序：FIXED_COLUMNS 去掉 id。
+
+        // 期望列序：FIXED_COLUMNS 去掉 id（与 insert_rows 拼 SQL 用的是同一来源）。
         let expected_names: Vec<&str> = FIXED_COLUMNS
             .iter()
             .map(|(n, _, _, _)| *n)
@@ -239,21 +252,52 @@ mod tests {
         assert_eq!(
             vals.len(),
             expected_names.len(),
-            "fixed_write_values 产出数量与 FIXED_COLUMNS(去id) 不符"
+            "fixed_write_values 产出数量({}) 与 FIXED_COLUMNS(去id)({}) 不符",
+            vals.len(),
+            expected_names.len()
         );
-        // 逐列校验：列名 → ColVal 变体必须与该列在 FIXED_COLUMNS 的类型一致。
+
+        // 逐位置断言：每个列名位置上的 ColVal 必须携带"该列"应有的值。
+        // 这是顺序锁定的核心——值与列名一一对应，互换即失败。
         for (name, val) in expected_names.iter().zip(vals.iter()) {
             match *name {
-                "ts" => assert!(matches!(val, ColVal::Time(_)), "ts 应为 Time"),
-                "ip" | "card_id" | "source" => {
-                    assert!(matches!(val, ColVal::Str(Some(_))), "{} 应为非空 Str", name)
-                }
-                "namespace" | "pod" => {
-                    assert!(matches!(val, ColVal::Str(_)), "{} 应为 Str", name)
-                }
-                // 其余固定列均为 DOUBLE 数值。
-                _ => assert!(matches!(val, ColVal::F64(_)), "{} 应为 F64", name),
+                "ts" => assert!(matches!(val, ColVal::Time(_)), "ts 位置应为 Time"),
+                "ip" => assert_colval_str(val, "IP-VALUE", "ip"),
+                "card_id" => assert_colval_str(val, "CARD-VALUE", "card_id"),
+                "namespace" => assert_colval_str(val, "NS-VALUE", "namespace"),
+                "pod" => assert_colval_str(val, "POD-VALUE", "pod"),
+                "source" => assert_colval_str(val, "SRC-VALUE", "source"),
+                "gpu_util" => assert_colval_f64(val, 101.0, "gpu_util"),
+                "mem_util" => assert_colval_f64(val, 102.0, "mem_util"),
+                "temp" => assert_colval_f64(val, 103.0, "temp"),
+                "power" => assert_colval_f64(val, 104.0, "power"),
+                "host_cpu" => assert_colval_f64(val, 105.0, "host_cpu"),
+                "host_mem" => assert_colval_f64(val, 106.0, "host_mem"),
+                "host_fds" => assert_colval_f64(val, 107.0, "host_fds"),
+                other => panic!("未知的固定列 {}: 测试需同步更新", other),
             }
+        }
+    }
+
+    /// 断言某位置的 ColVal 是携带期望字符串的 Str。
+    fn assert_colval_str(val: &ColVal, expect: &str, col: &str) {
+        match val {
+            ColVal::Str(Some(s)) => assert_eq!(
+                s, expect,
+                "{} 位置的字符串值不符(可能列顺序错乱)", col
+            ),
+            other => panic!("{} 位置期望 Str(Some({:?}))，实际 {:?}", col, expect, other),
+        }
+    }
+
+    /// 断言某位置的 ColVal 是携带期望数值的 F64。
+    fn assert_colval_f64(val: &ColVal, expect: f64, col: &str) {
+        match val {
+            ColVal::F64(Some(f)) => assert_eq!(
+                *f, expect,
+                "{} 位置的数值不符(可能列顺序错乱)", col
+            ),
+            other => panic!("{} 位置期望 F64(Some({}))，实际 {:?}", col, expect, other),
         }
     }
 }
