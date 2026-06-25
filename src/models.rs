@@ -37,7 +37,7 @@ pub type FieldValue = Option<f64>;
 /// - 数值列放在 `fields`（按列名索引，如 `gpu_util`/`temp`/`power`/`host_*`/`mem_util`）。
 /// - 字符串/维度列放在 `strings`（如 `namespace`、`pod`，以及资产表 join 来的 varchar 列）。
 ///
-/// 维度列 `ip`、`card_id`、`source` 与时间戳 `ts` 因在每行都固定且常用于对齐，
+/// 维度列 `ip`、`card_id`、`source` 与时间戳 `ts` 因在每行都固定，
 /// 单独作为具名字段，而不混入 map，避免遗漏与键名拼写错误。
 ///
 /// 注意：未派生 `Default`，因为 [`chrono::DateTime`] 仅对 `Utc`/`Local`/`FixedOffset`

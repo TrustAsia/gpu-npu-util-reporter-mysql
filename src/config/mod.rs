@@ -387,8 +387,7 @@ mod tests {
 
     /// 构造一份语法合法、校验通过的基础 YAML(无 mapping 段)。
     fn valid_base_yaml() -> String {
-        format!(
-            r#"
+        r#"
 interval: 60
 retention_days: 30
 retention_interval: 3600
@@ -414,13 +413,13 @@ sources:
   - name: "s1"
     ip: "1.1.1.1"
     url: "http://1.1.1.1:9090"
-    primary: {{ metric: "m1", card_label: "gpu" }}
+    primary: { metric: "m1", card_label: "gpu" }
     fields:
-      - {{ name: "gpu_util", from: "metric", metric: "m1" }}
+      - { name: "gpu_util", from: "metric", metric: "m1" }
     expressions:
-      - {{ name: "mem_util", expr: "a / b" }}
+      - { name: "mem_util", expr: "a / b" }
 "#
-        )
+        .to_string()
     }
 
     #[test]

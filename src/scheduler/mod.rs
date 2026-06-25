@@ -71,8 +71,13 @@ pub fn run<Q>(
 where
     Q: SourceQuerier + Send + Sync + 'static,
 {
-    // 时区：配置加载阶段已校验合法，此处的 unwrap_or 仅为防御（不影响正确性）。
-    let tz: chrono_tz::Tz = cfg.timezone.parse().unwrap_or(chrono_tz::Asia::Shanghai);
+    // 时区：配置加载阶段已校验合法（validate 会拒绝非法时区），此处用 expect
+    // 表明这是不变量；一旦校验逻辑被绕过应立即暴露，而非静默改用默认时区
+    // （静默改时区会让采集时间/清理基准错位，远比 panic 危险）。
+    let tz: chrono_tz::Tz = cfg
+        .timezone
+        .parse()
+        .expect("时区已在 config::validate 中校验为合法 IANA 名");
 
     // mapping 列名：从所有资产索引收集最终列名，供 INSERT 动态拼列。
     // （每个 source 都用同一套 mapping 列；未匹配的列在 join 阶段已置 NULL。）

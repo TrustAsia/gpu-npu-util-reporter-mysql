@@ -120,33 +120,43 @@ fn create_tar_gz(out: &Path, files: &[(&str, &PathBuf)]) -> Result<(), ArchiveEr
     Ok(())
 }
 
-/// 后台循环：每 `interval` 秒扫描归档一次。
+/// 后台归档循环的参数（`shutdown` 信号语义独立，单独传入 [`run_loop`]）。
 ///
-/// `tz` 为配置时区，用于算"今天"基准。失败只记日志，不退出循环。
+/// 把原本 8 个并列参数收进结构体，既满足"函数参数不过多"的可读性要求，
+/// 也让调用方（main）以字段赋值的形式表达，减少位置参数错位风险。
+pub struct LoopConfig {
+    pub dir: PathBuf,
+    pub archive_after_days: u32,
+    pub interval: u64,
+    pub prefix: String,
+    pub all_file: String,
+    pub error_file: String,
+    pub tz: chrono_tz::Tz,
+}
+
+/// 后台循环：每 `cfg.interval` 秒扫描归档一次。
+///
+/// `cfg.tz` 为配置时区，用于算"今天"基准。失败只记日志，不退出循环。
 /// `shutdown` 置位时在下次循环开始前退出（与采集任务同模式优雅退出）。
-pub async fn run_loop(
-    dir: PathBuf,
-    archive_after_days: u32,
-    interval: u64,
-    prefix: String,
-    all_file: String,
-    error_file: String,
-    tz: chrono_tz::Tz,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) {
+pub async fn run_loop(cfg: LoopConfig, shutdown: Arc<std::sync::atomic::AtomicBool>) {
     use std::sync::atomic::Ordering;
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        let today = chrono::Utc::now().with_timezone(&tz).date_naive();
-        if let Err(e) =
-            archive_old_logs(&dir, archive_after_days, today, &prefix, &all_file, &error_file)
-        {
+        let today = chrono::Utc::now().with_timezone(&cfg.tz).date_naive();
+        if let Err(e) = archive_old_logs(
+            &cfg.dir,
+            cfg.archive_after_days,
+            today,
+            &cfg.prefix,
+            &cfg.all_file,
+            &cfg.error_file,
+        ) {
             tracing::error!(target: "log_archive", "归档失败: {}", e.0);
         }
         // 分片睡眠以及时响应退出信号。
-        let mut remaining = interval;
+        let mut remaining = cfg.interval;
         while remaining > 0 {
             let step = remaining.min(1);
             tokio::time::sleep(Duration::from_secs(step)).await;

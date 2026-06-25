@@ -188,13 +188,15 @@ async fn main() {
     let shutdown_for_log = shutdown.clone();
     let log_handle = tokio::spawn(async move {
         log_archive::run_loop(
-            PathBuf::from(&log_cfg.dir),
-            log_cfg.archive_after_days,
-            3600, // 归档扫描间隔（秒）
-            log_cfg.archive_prefix.clone(),
-            log_cfg.all_file.clone(),
-            log_cfg.error_file.clone(),
-            tz,
+            log_archive::LoopConfig {
+                dir: PathBuf::from(&log_cfg.dir),
+                archive_after_days: log_cfg.archive_after_days,
+                interval: 3600, // 归档扫描间隔（秒）
+                prefix: log_cfg.archive_prefix.clone(),
+                all_file: log_cfg.all_file.clone(),
+                error_file: log_cfg.error_file.clone(),
+                tz,
+            },
             shutdown_for_log,
         )
         .await;
