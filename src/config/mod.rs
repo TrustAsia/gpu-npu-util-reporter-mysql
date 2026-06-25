@@ -304,6 +304,38 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         )));
     }
 
+    // —— 枚举类字段校验 ——
+    // 这些字段取值有限，但在运行期被 match 分支消费（见 main::init_logging、
+    // main 的 on_extra_columns 分支、extractor::collect_source 的 from 分支）。
+    // 若不在此拦截，用户拼错（如 "erorr"/"strict"/"metircs"）会被默认分支
+    // 静默吞掉，得到与预期不符的行为而无任何提示——与"启动即失败退出"原则相悖。
+    if !matches!(
+        cfg.logging.level.as_str(),
+        "error" | "warn" | "info" | "debug" | "trace"
+    ) {
+        return Err(ConfigError(format!(
+            "logging.level '{}' 非法，须为 error/warn/info/debug/trace",
+            cfg.logging.level
+        )));
+    }
+    // rotation 字段当前实现固定按日切分（见 main::daily_log_path），值仅作文档约束，
+    // 但仍校验合法枚举，避免用户误以为支持 hourly/never 而配置后无效果。
+    if !matches!(cfg.logging.rotation.as_str(), "daily" | "hourly" | "never") {
+        return Err(ConfigError(format!(
+            "logging.rotation '{}' 非法，须为 daily/hourly/never",
+            cfg.logging.rotation
+        )));
+    }
+    if !matches!(
+        cfg.database.on_extra_columns.as_str(),
+        "ask" | "continue" | "abort"
+    ) {
+        return Err(ConfigError(format!(
+            "database.on_extra_columns '{}' 非法，须为 ask/continue/abort",
+            cfg.database.on_extra_columns
+        )));
+    }
+
     let fixed = fixed_column_names();
 
     // 每个 source 的字段/表达式校验
@@ -311,11 +343,19 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         if src.name.is_empty() {
             return Err(ConfigError(format!("sources[{}].name 不能为空", i)));
         }
-        for fe in &src.fields {
+        for (fi, fe) in src.fields.iter().enumerate() {
+            // from 必须是已知枚举：extractor 用 match fc.from 消费，未知值走 `_ =>`
+            // 静默跳过该字段（永远写不进表）。在此拦截，避免"配错字段名却无提示"。
+            if !matches!(fe.from.as_str(), "metric" | "label") {
+                return Err(ConfigError(format!(
+                    "sources[{}].fields[{}]({}): from '{}' 非法，须为 metric/label",
+                    i, fi, fe.name, fe.from
+                )));
+            }
             if fe.from == "label" && fe.label.is_none() {
                 return Err(ConfigError(format!(
-                    "sources[{}].fields[{}]: from=label 时 label 必填",
-                    i, fe.name
+                    "sources[{}].fields[{}]({}): from=label 时 label 必填",
+                    i, fi, fe.name
                 )));
             }
         }
@@ -331,9 +371,19 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
 
     // 收集所有 mapping 最终列名，用于 position.anchor 跨源解析
     let mut all_mapping_names: HashSet<String> = HashSet::new();
-    for ms in &cfg.mapping.sources {
-        for c in &ms.columns {
-            all_mapping_names.insert(mapping_final_name(c));
+    let mut seen_final_names: HashSet<String> = HashSet::new();
+    for (si, ms) in cfg.mapping.sources.iter().enumerate() {
+        for (ci, col) in ms.columns.iter().enumerate() {
+            let final_name = mapping_final_name(col);
+            // 同名 mapping 列会导致建表 SQL 与 INSERT 列重复（MySQL 报错），
+            // 在此早期拦截并给出明确位置，优于让 SQL 执行时才暴露模糊错误。
+            if !seen_final_names.insert(final_name.clone()) {
+                return Err(ConfigError(format!(
+                    "mapping.sources[{}].columns[{}]: 最终列名 '{}' 与其它 mapping 列重复",
+                    si, ci, final_name
+                )));
+            }
+            all_mapping_names.insert(final_name);
         }
     }
 
@@ -524,6 +574,78 @@ sources:
             + "sources: []";
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：from 字段枚举校验。拼错（如 "metircs"）不应被静默跳过。
+    #[test]
+    fn rejects_bad_field_from() {
+        let yaml = valid_base_yaml().replace(
+            "from: \"metric\"",
+            "from: \"metircs\"", // 故意拼错
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：合法 from 值不误伤（metric/label 均应通过）。
+    #[test]
+    fn accepts_valid_field_from() {
+        let yaml = valid_base_yaml().replace(
+            "{ name: \"gpu_util\", from: \"metric\", metric: \"m1\" }",
+            "{ name: \"ns\", from: \"label\", metric: \"m1\", label: \"ns\" }",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// 守护：logging.level 枚举校验。拼错（如 "erorr"）不应静默退化。
+    #[test]
+    fn rejects_bad_logging_level() {
+        let yaml = valid_base_yaml().replace("level: \"info\"", "level: \"erorr\"");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：logging.rotation 枚举校验（虽当前实现固定 daily，仍拒绝非法值）。
+    #[test]
+    fn rejects_bad_logging_rotation() {
+        let yaml = valid_base_yaml().replace("rotation: \"daily\"", "rotation: \"weekly\"");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：on_extra_columns 枚举校验。非法值不应走默认 continue 分支。
+    #[test]
+    fn rejects_bad_on_extra_columns() {
+        // on_extra_columns 是 database 的字段，需注入到 database 块内。
+        let yaml = valid_base_yaml().replace(
+            "max_connections: 10",
+            "max_connections: 10\n  on_extra_columns: \"strict\"",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：同一 mapping 下多个列声明相同最终名应被拒绝（避免重复列）。
+    #[test]
+    fn rejects_duplicate_mapping_final_names() {
+        let base = valid_base_yaml();
+        let yaml = format!(
+            "{base}\nmapping:\n  enabled: true\n  sources:\n    - source_path: \"./a.csv\"\n      src_key: \"namespace\"\n      dest_key: \"Namespace\"\n      columns:\n        - source_field: \"x\"\n          rename: \"loc\"\n          type: \"varchar(64)\"\n          comment: \"c\"\n          position: {{ direction: after, anchor: \"namespace\" }}\n        - source_field: \"y\"\n          rename: \"loc\"\n          type: \"varchar(64)\"\n          comment: \"d\"\n          position: {{ direction: after, anchor: \"pod\" }}",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "重复最终列名应被拒绝");
+    }
+
+    /// 守护：不同 mapping 源之间也不能撞最终列名。
+    #[test]
+    fn rejects_duplicate_mapping_final_names_across_sources() {
+        let base = valid_base_yaml();
+        let yaml = format!(
+            "{base}\nmapping:\n  enabled: true\n  sources:\n    - source_path: \"./a.csv\"\n      src_key: \"namespace\"\n      dest_key: \"Namespace\"\n      columns:\n        - source_field: \"x\"\n          rename: \"owner\"\n          type: \"varchar(64)\"\n          comment: \"c\"\n          position: {{ direction: after, anchor: \"namespace\" }}\n    - source_path: \"./b.csv\"\n      src_key: \"ip\"\n      dest_key: \"IP\"\n      columns:\n        - source_field: \"y\"\n          rename: \"owner\"\n          type: \"varchar(64)\"\n          comment: \"c\"\n          position: {{ direction: after, anchor: \"pod\" }}",
+        );
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err(), "跨源重复最终列名应被拒绝");
     }
 
     /// 守护测试：示例配置 config.example.yaml 必须能解析并通过校验。
