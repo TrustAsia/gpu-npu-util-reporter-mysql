@@ -281,6 +281,14 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     if cfg.retention_interval == 0 {
         return Err(ConfigError("retention_interval 必须 > 0".into()));
     }
+    // retention_days=0 会让清理 SQL 退化为 DELETE ... WHERE ts < NOW()，
+    // 即每轮清理删掉当前时刻之前的全部行 → 数据全量丢失，且不可恢复。
+    // 这与 interval=0(忙循环)性质不同(后者只浪费资源)，此处会丢数据，故必须拦截。
+    if cfg.retention_days == 0 {
+        return Err(ConfigError(
+            "retention_days 必须 > 0（0 会触发全表删除，详见 sink::run_retention）".into(),
+        ));
+    }
     for (i, src) in cfg.sources.iter().enumerate() {
         if let Some(iv) = src.interval {
             if iv == 0 {
@@ -289,6 +297,14 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
                     i, src.name
                 )));
             }
+        }
+        // timeout=0 会让该源每次查询立即超时 → 该源每轮都失败、永远采不到数据。
+        // 有 serde 默认值 10 兜底，显式写 0 几乎必为笔误，在此早期拦截。
+        if src.timeout == 0 {
+            return Err(ConfigError(format!(
+                "sources[{}]({}).timeout 必须 > 0",
+                i, src.name
+            )));
         }
     }
     // 至少要有一个数据源，否则程序空跑。
@@ -541,6 +557,26 @@ sources:
     #[test]
     fn rejects_zero_retention_interval() {
         let yaml = valid_base_yaml().replace("retention_interval: 3600", "retention_interval: 0");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：retention_days=0 会触发全表删除（SQL 退化为 ts < NOW()），
+    /// 必须在启动期拦截，避免数据静默丢失。
+    #[test]
+    fn rejects_zero_retention_days() {
+        let yaml = valid_base_yaml().replace("retention_days: 30", "retention_days: 0");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// 守护：source.timeout=0 会让该源每轮查询都立即超时，应早期拦截。
+    #[test]
+    fn rejects_zero_source_timeout() {
+        let yaml = valid_base_yaml().replace(
+            "primary: { metric: \"m1\", card_label: \"gpu\" }",
+            "timeout: 0\n    primary: { metric: \"m1\", card_label: \"gpu\" }",
+        );
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         assert!(validate(&cfg).is_err());
     }
