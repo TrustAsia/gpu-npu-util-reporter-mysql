@@ -663,8 +663,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpu-npu-util-reporter"
-version = "0.15.0"
+name = "gpu-npu-util-reporter-mysql"
+version = "0.15.1"
 dependencies = [
  "async-trait",
  "calamine",

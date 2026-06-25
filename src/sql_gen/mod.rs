@@ -21,7 +21,7 @@ pub fn generate(cfg: &Config) -> String {
     let has_mapping = cfg.mapping.enabled || !cfg.mapping.sources.is_empty();
 
     let mut lines: Vec<String> = Vec::new();
-    lines.push("-- 由 gpu-npu-util-reporter --init 自动生成".into());
+    lines.push("-- 由 gpu-npu-util-reporter-mysql --init 自动生成".into());
     lines.push(format!("-- 配置文件对应表: {}", cfg.database.table));
     lines.push(format!("-- 含 mapping 列: {}", has_mapping));
     lines.push("-- 注意: 本文件不含 DROP TABLE，重复执行会因表已存在而跳过(IF NOT EXISTS)。".into());

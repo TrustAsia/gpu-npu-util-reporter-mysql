@@ -73,13 +73,13 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          mv gpu-npu-util-reporter${{ matrix.suffix }} gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}${{ matrix.suffix }}
+          mv gpu-npu-util-reporter-mysql${{ matrix.suffix }} gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-${{ matrix.target }}${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-npu-util-reporter-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}${{ matrix.suffix }}
+          name: gpu-npu-util-reporter-mysql-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-${{ matrix.target }}${{ matrix.suffix }}
           if-no-files-found: error
 
   build-darwin:
@@ -124,13 +124,13 @@ jobs:
       - name: Rename binary for release
         run: |
           cd target/${{ matrix.target }}/release
-          mv gpu-npu-util-reporter gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          mv gpu-npu-util-reporter-mysql gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gpu-npu-util-reporter-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/gpu-npu-util-reporter-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          name: gpu-npu-util-reporter-mysql-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-${{ matrix.target }}
           if-no-files-found: error
 
   release:
@@ -209,11 +209,11 @@ jobs:
 
             | File | Platform |
             |------|----------|
-            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.exe` | Windows x86_64 |
-            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl` | Linux x86_64 (static) |
-            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl` | Linux ARM64 (static) |
-            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-x86_64-apple-darwin` | macOS Intel |
-            | `gpu-npu-util-reporter-${{ steps.version.outputs.version }}-aarch64-apple-darwin` | macOS Apple Silicon |
+            | `gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-x86_64-pc-windows-msvc.exe` | Windows x86_64 |
+            | `gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl` | Linux x86_64 (static) |
+            | `gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-aarch64-unknown-linux-musl` | Linux ARM64 (static) |
+            | `gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-x86_64-apple-darwin` | macOS Intel |
+            | `gpu-npu-util-reporter-mysql-${{ steps.version.outputs.version }}-aarch64-apple-darwin` | macOS Apple Silicon |
           files: artifacts/*
           draft: false
           prerelease: ${{ steps.tag.outputs.prerelease }}

@@ -1,4 +1,4 @@
-//! # gpu-npu-util-reporter 入口
+//! # gpu-npu-util-reporter-mysql 入口
 //!
 //! 命令行解析 → 加载配置 → 初始化日志 → 按模式分支：
 //! - `--init`：仅生成 `./init/<table>.sql` 后退出（不连任何外部服务、不写日志文件）。
@@ -10,7 +10,7 @@
 //! 重试无意义）。运行期错误由 scheduler/log_archive 各自隔离，不退出。
 
 // 业务模块来自库 crate（src/lib.rs），二进制仅做编排/CLI/日志/退出。
-use gpu_npu_util_reporter::{config, log_archive, mapping, scheduler, sink, source, sql_gen};
+use gpu_npu_util_reporter_mysql::{config, log_archive, mapping, scheduler, sink, source, sql_gen};
 
 use clap::Parser;
 use std::io::{self, Write};
@@ -21,7 +21,7 @@ use tracing_subscriber::fmt::MakeWriter;
 /// 命令行参数。
 #[derive(Parser, Debug)]
 #[command(
-    name = "gpu-npu-util-reporter",
+    name = "gpu-npu-util-reporter-mysql",
     about = "定时从多个 Prometheus 读取计算卡/主机指标，对齐后写入 MySQL"
 )]
 struct Args {
@@ -88,7 +88,7 @@ async fn main() {
         version = env!("CARGO_PKG_VERSION"),
         sources = cfg.sources.len(),
         interval = cfg.interval,
-        "gpu-npu-util-reporter 启动"
+        "gpu-npu-util-reporter-mysql 启动"
     );
 
     // 建立 MySQL 连接池。

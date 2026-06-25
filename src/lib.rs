@@ -1,4 +1,4 @@
-//! # gpu-npu-util-reporter 库入口
+//! # gpu-npu-util-reporter-mysql 库入口
 //!
 //! 把各业务模块暴露为公共 API，供集成测试（`tests/`）与未来其它调用方访问。
 //! 二进制入口在 [`main`](../main.rs)，二者共享同一组模块实现。
