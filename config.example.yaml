@@ -81,12 +81,18 @@ mapping:
 
 # ---------------------------------------------------------------------
 # 数据源列表。卡类型差异完全靠配置表达，不改代码。
+#
+# ip 字段：
+#   - 单主机模式：填写固定 IP（如 ip: "10.0.0.1"），每行 ip 为此固定值。
+#   - 多主机模式：留空或省略 ip（如 ip: ""），此时 ip 从 Prometheus 样本的
+#     instance 标签中自动提取（instance="10.0.0.1:9400" → ip="10.0.0.1"），
+#     一个 source 配置即可采集该 Prometheus 上所有主机和所有卡的数据。
 # ---------------------------------------------------------------------
 sources:
-  # ===== 示例1: NVIDIA GPU (dcgm-exporter) =====
-  - name: "gpu-cluster-a"
-    ip: "10.0.0.1"                     # 本源主机IP(写入行的ip字段)
-    url: "http://10.0.0.1:9400"        # Prometheus 地址
+  # ===== 示例1: 单主机模式 — 每个 source 对应一台主机的 Prometheus =====
+  - name: "gpu-single-host"
+    ip: "10.0.0.1"                     # 单主机模式：固定 IP
+    url: "http://10.0.0.1:9400"        # 该主机自己的 Prometheus
     timeout: 10                        # 查询超时(秒)，默认10
     interval: 30                       # 覆盖全局 interval
     primary:                           # 主指标：枚举所有卡片，决定行数
@@ -109,7 +115,33 @@ sources:
       - name: "host_fds"
         expr: "node_filefd_allocated"
 
-  # ===== 示例2: 昇腾 NPU (npu-exporter) =====
+  # ===== 示例2: 多主机模式 — 一个 source 采集聚合 Prometheus 上所有主机的数据 =====
+  # ip 留空，程序从 instance 标签自动提取每台主机的 IP。
+  # 对齐键包含 instance + card_label，不同主机的同名卡号不会冲突。
+  - name: "gpu-multi-host"
+    ip: ""                             # 多主机模式：留空，ip 从 instance 标签提取
+    url: "http://prometheus-cluster:9090"  # 聚合 Prometheus（含所有主机数据）
+    primary:
+      metric: "DCGM_FI_DEV_GPU_UTIL"
+      card_label: "gpu"
+    fields:
+      - { name: "gpu_util", from: "metric", metric: "DCGM_FI_DEV_GPU_UTIL" }
+      - { name: "temp",     from: "metric", metric: "DCGM_FI_DEV_GPU_TEMP" }
+      - { name: "power",    from: "metric", metric: "DCGM_FI_DEV_POWER_USAGE" }
+      - { name: "namespace", from: "label", metric: "DCGM_FI_DEV_GPU_UTIL", label: "namespace" }
+      - { name: "pod",       from: "label", metric: "DCGM_FI_DEV_GPU_UTIL", label: "pod" }
+    expressions:
+      - name: "mem_util"
+        expr: "DCGM_FI_DEV_FB_USED / (DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE)"
+    host_fields:
+      - name: "host_cpu"
+        expr: '100 - (avg by(instance)(irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)'
+      - name: "host_mem"
+        expr: "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100"
+      - name: "host_fds"
+        expr: "node_filefd_allocated"
+
+  # ===== 示例3: 昇腾 NPU (npu-exporter) =====
   - name: "npu-cluster-b"
     ip: "10.0.0.2"
     url: "http://10.0.0.2:9401"

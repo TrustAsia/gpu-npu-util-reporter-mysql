@@ -50,6 +50,11 @@ impl SourceQuerier for PrometheusClient {
 /// 采集一个 source 的所有行（每张卡一行）。失败返回 Err，由 scheduler 隔离。
 ///
 /// `Q` 为查询器类型（真实 client 或测试 mock），要求 `Sync`（async 跨 await 复用引用）。
+///
+/// ## 多主机支持
+/// 当 `cfg.ip` 为空时，ip 从 Prometheus 样本的 `instance` 标签中提取
+/// （`instance="host:port"` → 取 `host` 部分）。此时对齐键包含 `instance`，
+/// 使不同主机的同名卡号不冲突。`host_fields` 也按 `instance` 分组取值。
 pub async fn collect_source<Q: SourceQuerier + Sync>(
     cfg: &SourceConfig,
     client: &Q,
@@ -64,6 +69,10 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         return Ok(Vec::new());
     }
 
+    // 判断是否为多主机模式（ip 未配置 → 从 instance 标签提取）。
+    let multi_host = cfg.ip.is_empty();
+    let instance_label = "instance";
+
     // 2. 批量查询用到的所有 metric（fields 来源 + expressions 变量），缓存。
     let needed_metrics = collect_needed_metrics(cfg);
     let mut metric_cache: HashMap<String, Vec<MetricSample>> = HashMap::new();
@@ -72,7 +81,12 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         metric_cache.insert(m.clone(), samples);
     }
 
-    let align_labels = vec![card_label.clone()];
+    // 对齐标签：多主机模式下包含 instance + card_label，单主机模式仅 card_label。
+    let align_labels: Vec<String> = if multi_host {
+        vec![instance_label.into(), card_label.clone()]
+    } else {
+        vec![card_label.clone()]
+    };
 
     // 预建索引：每个 metric 的"对齐键->值"与"对齐键->标签集"只算一次，
     // 避免在逐卡循环里反复重建 HashMap（原本是 O(卡数×字段数×样本数)）。
@@ -107,49 +121,89 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         }
     }
 
-    // 3. 主机级字段（整主机单值）：每个 host_field 查一次，取首条序列的值。
-    //    单个 host_field 查询失败只让该字段本轮写 NULL（WARN），不连累整个 source
-    //    （与逐卡字段缺失的软失败语义一致；否则抖动的 host_cpu 查询会丢掉全部卡数据）。
-    let mut host_values: HashMap<String, f64> = HashMap::new();
-    for hf in &cfg.host_fields {
-        match client.query(&hf.expr).await {
-            Ok(samples) => {
-                if let Some(first) = samples.first() {
-                    // 非有限值（NaN/±Inf）规范化为缺席 → 后续填 NULL（见 finite_or_none 文档）。
-                    if first.value.is_finite() {
-                        host_values.insert(hf.name.clone(), first.value);
+    // 3. 主机级字段（整主机单值）：按 instance 分组。
+    //    多主机模式下，每个 host_field 的样本包含多台主机的序列，
+    //    需按 instance 分组后取各主机各自的首条值。
+    //    单主机模式下退化为整 source 一个值（向后兼容）。
+    let host_values_by_instance: HashMap<String, HashMap<String, f64>> = if multi_host {
+        let mut map: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for hf in &cfg.host_fields {
+            match client.query(&hf.expr).await {
+                Ok(samples) => {
+                    for s in &samples {
+                        if !s.value.is_finite() {
+                            continue;
+                        }
+                        let inst = s.labels.get(instance_label).cloned().unwrap_or_default();
+                        let ip = extract_ip_from_instance(&inst);
+                        map.entry(ip).or_default().insert(hf.name.clone(), s.value);
                     }
                 }
-                // 无结果或非有限值 → 该字段缺席（后续填 NULL）。
-            }
-            Err(e) => {
-                tracing::warn!(
-                    field = %hf.name,
-                    error = %e.0,
-                    "host_field 查询失败，该字段本轮写 NULL"
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        field = %hf.name,
+                        error = %e.0,
+                        "host_field 查询失败，该字段本轮写 NULL"
+                    );
+                }
             }
         }
-    }
+        map
+    } else {
+        // 单主机模式：host_fields 全局一个值，所有卡相同（向后兼容）。
+        let mut host_values: HashMap<String, f64> = HashMap::new();
+        for hf in &cfg.host_fields {
+            match client.query(&hf.expr).await {
+                Ok(samples) => {
+                    if let Some(first) = samples.first() {
+                        if first.value.is_finite() {
+                            host_values.insert(hf.name.clone(), first.value);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        field = %hf.name,
+                        error = %e.0,
+                        "host_field 查询失败，该字段本轮写 NULL"
+                    );
+                }
+            }
+        }
+        if host_values.is_empty() {
+            HashMap::new()
+        } else {
+            // 单主机模式用空字符串作为 instance 键。
+            HashMap::from([(String::new(), host_values)])
+        }
+    };
 
     let now = Utc::now().with_timezone(&tz);
 
-    // 按 card_id 去重：同一张卡只保留首个序列的行。
-    // Prometheus 主指标可能返回多个序列共享同一 card_id（如不同 namespace/pod 的
-    // DCGM_FI_DEV_GPU_UTIL），若每个序列都生成一行，同一张卡会重复写入多行。
-    // 语义上"取一次当前瞬时完整值"：每个 (ip, card_id) 只写一行。
+    // 按 (instance, card_id) 去重：同一台主机的同一张卡只保留首个序列的行。
+    // Prometheus 主指标可能返回多个序列共享同一 (instance, card_id)（如不同
+    // namespace/pod），若每个序列都生成一行，会重复写入。语义上"取一次当前瞬时
+    // 完整值"：每个 (ip, card_id) 只写一行。
     let mut seen_cards: HashSet<String> = HashSet::new();
     let mut rows = Vec::with_capacity(primary_samples.len());
     for ps in &primary_samples {
         let card_id = ps.labels.get(card_label).cloned().unwrap_or_default();
-        if !seen_cards.insert(card_id.clone()) {
-            continue; // 同一张卡的后续序列跳过
+        // 多主机模式下 ip 从 instance 标签提取；单主机模式下使用配置的固定 ip。
+        let ip = if multi_host {
+            let inst = ps.labels.get(instance_label).cloned().unwrap_or_default();
+            extract_ip_from_instance(&inst)
+        } else {
+            cfg.ip.clone()
+        };
+        let dedup_key = format!("{}\x1f{}", ip, card_id);
+        if !seen_cards.insert(dedup_key) {
+            continue; // 同一台主机同一张卡的后续序列跳过
         }
         let key = align::make_key(&ps.labels, &align_labels);
 
         let mut row = Row {
             ts: now,
-            ip: cfg.ip.clone(),
+            ip: ip.clone(),
             card_id: card_id.clone(),
             fields: HashMap::new(),
             strings: HashMap::new(),
@@ -190,14 +244,41 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
             row.fields.insert(ec.name.clone(), val);
         }
 
-        // 主机级字段复制到该行（按 ip，整主机一个值，每张卡相同）。
-        for (name, v) in &host_values {
-            row.fields.insert(name.clone(), Some(*v));
+        // 主机级字段：按 ip 查该主机的 host_values（多主机模式按 instance 分组，
+        // 单主机模式用空字符串键退化为全局值）。
+        let host_key = if multi_host { &ip } else { "" };
+        if let Some(hv) = host_values_by_instance.get(host_key) {
+            for (name, v) in hv {
+                row.fields.insert(name.clone(), Some(*v));
+            }
         }
 
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// 从 Prometheus `instance` 标签中提取 IP/主机名。
+///
+/// `instance` 格式通常为 `"host:port"`（如 `"10.0.0.1:9400"`），
+/// 取冒号前的部分作为 ip 值。若无冒号则原样返回。
+///
+/// 使用 `rsplit_once(':')` 从右侧分割，以正确处理 IPv6+port 格式
+/// （如 `"[::1]:9090"` → `"[::1]"`）。裸 IPv6（无端口，如 `::1`）
+/// 不在 Prometheus instance 标签的格式范围内，但做防御处理：若分割后
+/// host 部分仍含冒号且未被方括号包裹，视为裸 IPv6 原样返回。
+fn extract_ip_from_instance(instance: &str) -> String {
+    if let Some((host, port)) = instance.rsplit_once(':') {
+        // port 部分为纯数字且 host 不含裸冒号 → 视为 host:port 格式
+        if port.parse::<u16>().is_ok() && !host.contains(':') {
+            return host.to_string();
+        }
+        // host 含冒号但被方括号包裹（如 "[::1]"）→ 也是 host:port 格式
+        if port.parse::<u16>().is_ok() && host.starts_with('[') && host.ends_with(']') {
+            return host.to_string();
+        }
+    }
+    instance.to_string()
 }
 
 /// 提取表达式中的变量名（metric 名）。
@@ -303,5 +384,33 @@ mod tests {
         assert_eq!(finite_or_none(f64::NAN), None);
         assert_eq!(finite_or_none(f64::INFINITY), None);
         assert_eq!(finite_or_none(f64::NEG_INFINITY), None);
+    }
+
+    /// 守护：extract_ip_from_instance 从 "host:port" 格式中提取 host 部分。
+    #[test]
+    fn extract_ip_from_instance_strips_port() {
+        assert_eq!(extract_ip_from_instance("10.0.0.1:9400"), "10.0.0.1");
+        assert_eq!(extract_ip_from_instance("192.168.1.100:9090"), "192.168.1.100");
+    }
+
+    /// 守护：extract_ip_from_instance 对无端口的 instance 原样返回。
+    #[test]
+    fn extract_ip_from_instance_no_port() {
+        assert_eq!(extract_ip_from_instance("10.0.0.1"), "10.0.0.1");
+        assert_eq!(extract_ip_from_instance(""), "");
+    }
+
+    /// 守护：extract_ip_from_instance 对 IPv6 地址正确提取（取最后一个冒号）。
+    #[test]
+    fn extract_ip_from_instance_ipv6() {
+        // IPv6 + port 如 "[::1]:9090" → 取 "[::1]"
+        assert_eq!(extract_ip_from_instance("[::1]:9090"), "[::1]");
+    }
+
+    /// 守护：extract_ip_from_instance 对裸 IPv6（无端口）原样返回。
+    #[test]
+    fn extract_ip_from_instance_bare_ipv6() {
+        // "::1" 无端口后缀，不应截断
+        assert_eq!(extract_ip_from_instance("::1"), "::1");
     }
 }

@@ -5,11 +5,8 @@
 //!
 //! 对齐键由若干标签值拼接而成（用 `'\x1f'` 单元分隔符避免与正常值碰撞）。
 //! 对 DCGM/NPU 等"单维度卡号"场景，对齐标签只有一个（gpu 或 id）。
-//!
-//! **设计前提**：一个 source 对应一台主机的 Prometheus（见 [`crate::config::SourceConfig`]），
-//! 故同一 source 内 `card_label` 已唯一标识一张卡，无需再叠加 ip/instance。
-//! 若未来需支持单源聚合多机，应把对齐标签扩展为 `[card_label, instance]` 之类
-//! （本模块 `align_labels` 已是 `Vec`，天然支持多标签拼接）。
+//! 多主机场景（一个 Prometheus 聚合多机数据）下，对齐标签包含 instance + card_label，
+//! 使不同主机的同名卡号不冲突。
 
 use crate::models::MetricSample;
 use std::collections::HashMap;

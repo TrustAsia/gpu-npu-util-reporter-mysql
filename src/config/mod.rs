@@ -159,6 +159,9 @@ pub struct SourceConfig {
     /// 数据源名(写入行的 source 字段，区分不同源)。
     pub name: String,
     /// 本源主机 IP(写入行的 ip 字段)。
+    /// 单主机场景下填写固定 IP；多主机场景(Prometheus 聚合多机数据)下留空或省略，
+    /// 此时 ip 从 Prometheus 样本的 instance 标签中提取(instance="host:port" → 取 host 部分)。
+    #[serde(default)]
     pub ip: String,
     /// Prometheus 地址。
     pub url: String,
