@@ -160,9 +160,15 @@ pub struct SourceConfig {
     pub name: String,
     /// 本源主机 IP(写入行的 ip 字段)。
     /// 单主机场景下填写固定 IP；多主机场景(Prometheus 聚合多机数据)下留空或省略，
-    /// 此时 ip 从 Prometheus 样本的 instance 标签中提取(instance="host:port" → 取 host 部分)。
+    /// 此时 ip 从 Prometheus 样本的 ip_label 标签中提取。
     #[serde(default)]
     pub ip: String,
+    /// 多主机模式下提取 ip 的 Prometheus 标签名。默认 `"instance"`。
+    /// instance 标签格式通常为 `"host:port"`（如 `"10.0.0.1:9400"`），程序自动去掉端口部分。
+    /// 若 Prometheus 使用其它标签标识主机（如 `exported_instance`、`node` 等），在此指定。
+    /// 仅当 `ip` 为空时生效；`ip` 非空时本字段被忽略。
+    #[serde(default = "default_ip_label")]
+    pub ip_label: String,
     /// Prometheus 地址。
     pub url: String,
     /// 查询超时(秒)，默认 10。
@@ -181,6 +187,10 @@ pub struct SourceConfig {
 
 fn default_timeout() -> u64 {
     10
+}
+
+fn default_ip_label() -> String {
+    "host_ip".into()
 }
 
 /// 主指标：枚举所有卡片序列，决定每个 source 每轮的行数。

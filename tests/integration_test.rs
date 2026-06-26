@@ -49,6 +49,7 @@ async fn collect_two_cards_with_partial_field() {
     let src = SourceConfig {
         name: "test".into(),
         ip: "10.0.0.1".into(),
+        ip_label: "host_ip".into(),
         url: "http://x".into(),
         timeout: 10,
         interval: None,
@@ -117,6 +118,7 @@ async fn expression_evaluates_per_card() {
     let src = SourceConfig {
         name: "t".into(),
         ip: "1.1.1.1".into(),
+        ip_label: "host_ip".into(),
         url: "http://x".into(),
         timeout: 10,
         interval: None,
@@ -155,6 +157,7 @@ async fn mapping_join_after_collect() {
     let src = SourceConfig {
         name: "t".into(),
         ip: "1.1.1.1".into(),
+        ip_label: "host_ip".into(),
         url: "http://x".into(),
         timeout: 10,
         interval: None,

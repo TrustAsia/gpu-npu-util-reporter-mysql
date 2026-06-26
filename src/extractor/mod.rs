@@ -69,9 +69,9 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         return Ok(Vec::new());
     }
 
-    // 判断是否为多主机模式（ip 未配置 → 从 instance 标签提取）。
+    // 判断是否为多主机模式（ip 未配置 → 从 ip_label 标签提取）。
     let multi_host = cfg.ip.is_empty();
-    let instance_label = "instance";
+    let ip_label = &cfg.ip_label;
 
     // 2. 批量查询用到的所有 metric（fields 来源 + expressions 变量），缓存。
     let needed_metrics = collect_needed_metrics(cfg);
@@ -81,9 +81,9 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         metric_cache.insert(m.clone(), samples);
     }
 
-    // 对齐标签：多主机模式下包含 instance + card_label，单主机模式仅 card_label。
+    // 对齐标签：多主机模式下包含 ip_label + card_label，单主机模式仅 card_label。
     let align_labels: Vec<String> = if multi_host {
-        vec![instance_label.into(), card_label.clone()]
+        vec![ip_label.clone(), card_label.clone()]
     } else {
         vec![card_label.clone()]
     };
@@ -134,7 +134,7 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
                         if !s.value.is_finite() {
                             continue;
                         }
-                        let inst = s.labels.get(instance_label).cloned().unwrap_or_default();
+                        let inst = s.labels.get(ip_label).cloned().unwrap_or_default();
                         let ip = extract_ip_from_instance(&inst);
                         map.entry(ip).or_default().insert(hf.name.clone(), s.value);
                     }
@@ -188,9 +188,9 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
     let mut rows = Vec::with_capacity(primary_samples.len());
     for ps in &primary_samples {
         let card_id = ps.labels.get(card_label).cloned().unwrap_or_default();
-        // 多主机模式下 ip 从 instance 标签提取；单主机模式下使用配置的固定 ip。
+        // 多主机模式下 ip 从 ip_label 标签提取；单主机模式下使用配置的固定 ip。
         let ip = if multi_host {
-            let inst = ps.labels.get(instance_label).cloned().unwrap_or_default();
+            let inst = ps.labels.get(ip_label).cloned().unwrap_or_default();
             extract_ip_from_instance(&inst)
         } else {
             cfg.ip.clone()
@@ -255,6 +255,26 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
 
         rows.push(row);
     }
+
+    // 按 (ip, card_id) 排序：同一主机的卡连续排列，卡号有序。
+    // 多主机场景下 Prometheus 返回的样本顺序不确定，不排序会导致数据凌乱。
+    // card_id 数值排序（如 "0","1","10"）比字典序（"0","1","10" 一致但 "2">"10"）
+    // 更符合运维预期——绝大多数 GPU/NPU 卡号为纯数字。
+    rows.sort_by(|a, b| {
+        match a.ip.cmp(&b.ip) {
+            std::cmp::Ordering::Equal => {
+                // 优先尝试数值排序（纯数字卡号），回退字典序。
+                let a_num = a.card_id.parse::<u32>();
+                let b_num = b.card_id.parse::<u32>();
+                match (a_num, b_num) {
+                    (Ok(an), Ok(bn)) => an.cmp(&bn),
+                    _ => a.card_id.cmp(&b.card_id),
+                }
+            }
+            other => other,
+        }
+    });
+
     Ok(rows)
 }
 
@@ -412,5 +432,52 @@ mod tests {
     fn extract_ip_from_instance_bare_ipv6() {
         // "::1" 无端口后缀，不应截断
         assert_eq!(extract_ip_from_instance("::1"), "::1");
+    }
+
+    /// 守护：采集行按 (ip, card_id) 排序，card_id 纯数字时数值排序。
+    #[test]
+    fn rows_sorted_by_ip_then_numeric_card_id() {
+        use crate::models::Row;
+        let tz = chrono_tz::Asia::Shanghai;
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let make_row = |ip: &str, card_id: &str| Row {
+            ts: now.clone(),
+            ip: ip.into(),
+            card_id: card_id.into(),
+            fields: Default::default(),
+            strings: Default::default(),
+            source: "test".into(),
+        };
+        let mut rows = vec![
+            make_row("10.0.0.2", "1"),
+            make_row("10.0.0.1", "10"),
+            make_row("10.0.0.1", "2"),
+            make_row("10.0.0.2", "0"),
+            make_row("10.0.0.1", "1"),
+        ];
+        rows.sort_by(|a, b| {
+            match a.ip.cmp(&b.ip) {
+                std::cmp::Ordering::Equal => {
+                    let a_num = a.card_id.parse::<u32>();
+                    let b_num = b.card_id.parse::<u32>();
+                    match (a_num, b_num) {
+                        (Ok(an), Ok(bn)) => an.cmp(&bn),
+                        _ => a.card_id.cmp(&b.card_id),
+                    }
+                }
+                other => other,
+            }
+        });
+        // 10.0.0.1 在前，card_id 按 1,2,10 数值排序（非字典序 1,10,2）
+        assert_eq!(rows[0].ip, "10.0.0.1");
+        assert_eq!(rows[0].card_id, "1");
+        assert_eq!(rows[1].ip, "10.0.0.1");
+        assert_eq!(rows[1].card_id, "2");
+        assert_eq!(rows[2].ip, "10.0.0.1");
+        assert_eq!(rows[2].card_id, "10");
+        assert_eq!(rows[3].ip, "10.0.0.2");
+        assert_eq!(rows[3].card_id, "0");
+        assert_eq!(rows[4].ip, "10.0.0.2");
+        assert_eq!(rows[4].card_id, "1");
     }
 }

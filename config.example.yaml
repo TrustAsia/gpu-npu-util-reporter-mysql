@@ -116,10 +116,14 @@ sources:
         expr: "node_filefd_allocated"
 
   # ===== 示例2: 多主机模式 — 一个 source 采集聚合 Prometheus 上所有主机的数据 =====
-  # ip 留空，程序从 instance 标签自动提取每台主机的 IP。
-  # 对齐键包含 instance + card_label，不同主机的同名卡号不会冲突。
+  # ip 留空，程序从 ip_label 标签自动提取每台主机的 IP。
+  # 对齐键包含 ip_label + card_label，不同主机的同名卡号不会冲突。
   - name: "gpu-multi-host"
-    ip: ""                             # 多主机模式：留空，ip 从 instance 标签提取
+    ip: ""                             # 多主机模式：留空，ip 从标签提取
+    ip_label: "host_ip"             # 提取 ip 的 Prometheus 标签名(默认 host_ip)
+                                       # host_ip="10.0.0.1" → ip="10.0.0.1"
+                                       # 若用其它标签(如 instance)，在此指定
+                                       # instance="10.0.0.1:9400" → 自动去掉端口
     url: "http://prometheus-cluster:9090"  # 聚合 Prometheus（含所有主机数据）
     primary:
       metric: "DCGM_FI_DEV_GPU_UTIL"
