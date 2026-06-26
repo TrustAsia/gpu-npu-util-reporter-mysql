@@ -134,9 +134,17 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
 
     let now = Utc::now().with_timezone(&tz);
 
+    // 按 card_id 去重：同一张卡只保留首个序列的行。
+    // Prometheus 主指标可能返回多个序列共享同一 card_id（如不同 namespace/pod 的
+    // DCGM_FI_DEV_GPU_UTIL），若每个序列都生成一行，同一张卡会重复写入多行。
+    // 语义上"取一次当前瞬时完整值"：每个 (ip, card_id) 只写一行。
+    let mut seen_cards: HashSet<String> = HashSet::new();
     let mut rows = Vec::with_capacity(primary_samples.len());
     for ps in &primary_samples {
         let card_id = ps.labels.get(card_label).cloned().unwrap_or_default();
+        if !seen_cards.insert(card_id.clone()) {
+            continue; // 同一张卡的后续序列跳过
+        }
         let key = align::make_key(&ps.labels, &align_labels);
 
         let mut row = Row {
