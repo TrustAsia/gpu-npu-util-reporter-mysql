@@ -49,7 +49,7 @@ impl Sink {
             .password(&cfg.database.password)
             .database(&cfg.database.database);
         let tz: chrono_tz::Tz = cfg.timezone.parse().expect("时区已校验");
-        let tz_sql = schema::set_timezone_sql(tz);
+        let tz_sql = schema::set_timezone_sql(tz, cfg.database.timezone_offset);
         let pool = MySqlPoolOptions::new()
             .max_connections(cfg.database.max_connections)
             .after_connect(move |conn, _meta| {

@@ -57,6 +57,11 @@ pub struct DatabaseConfig {
     /// `ask`(交互询问,非TTY回退continue) / `continue`(仅告警) / `abort`(退出)。
     #[serde(default = "default_on_extra_columns")]
     pub on_extra_columns: String,
+    /// MySQL SET time_zone 使用 UTC 偏移格式(如 +08:00)而非 IANA 名(如 Asia/Shanghai)。
+    /// true(默认): 偏移格式，MySQL 无需加载时区表即可生效（Windows 默认无时区表）。
+    /// false: IANA 名，需 MySQL 已加载时区表（Linux 通常已加载），但能正确处理夏令时。
+    #[serde(default = "default_true")]
+    pub timezone_offset: bool,
 }
 
 /// `on_extra_columns` 的默认值。

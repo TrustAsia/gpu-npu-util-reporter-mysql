@@ -30,6 +30,10 @@ database:
                             # 校验仅允许 [A-Za-z_][A-Za-z0-9_]*（含连字符/空格/引号会被启动期拒绝）。
                             # 另：保留字(order 等)虽过校验但运行期仍报错，应一并避免。
   max_connections: 10        # 连接池大小(必须 >0；0 会让启动永久挂起)
+  # MySQL SET time_zone 格式：
+  #   true(默认): 使用 UTC 偏移(如 +08:00)，无需 MySQL 加载时区表，Windows 兼容
+  #   false: 使用 IANA 名(如 Asia/Shanghai)，需 MySQL 已加载时区表，但能处理夏令时
+  timezone_offset: true
   # schema 校验策略：正常启动对比实际表列与期望列。缺列恒报错退出；
   # 多列时: ask(交互询问,非TTY回退continue) / continue(仅告警) / abort(退出)
   on_extra_columns: "ask"
