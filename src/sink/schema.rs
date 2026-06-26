@@ -3,6 +3,7 @@
 //! 把"对比期望列与实际列"和"拼各类 SQL"都做成纯函数，便于单元测试；
 //! 真正执行（连库、fetch、execute）在 [`super::Sink`] 中。
 
+use chrono::Offset;
 use std::collections::{HashMap, HashSet};
 
 /// schema 校验结果。
@@ -57,13 +58,15 @@ pub fn compare(expected: &HashSet<String>, actual: &HashSet<String>) -> SchemaCh
 
 /// 连接级时区 SET 语句（程序/连接/清理三方须同一时区）。
 ///
-/// **安全前提**：`tz` 经字符串插值拼进 `'...'` 字面量（MySQL 不支持对会话变量用参数
-/// 绑定）。这**不可注入**，但完全依赖 [`crate::config::validate`] 对 `timezone` 的
-/// `chrono_tz::Tz` 解析校验：IANA 时区名字符集为 `[A-Za-z0-9_/+~-]`，不含单引号/
-/// 反斜杠/分号，无法突破 `'...'` 字面量边界。若将来放宽校验（如允许 `+08:00` 偏移或
-/// `SYSTEM`），必须同步改用参数化或额外字符过滤——**此处是安全不变量的承载点**。
-pub fn set_timezone_sql(tz: &str) -> String {
-    format!("SET time_zone = '{}'", tz)
+/// 将 IANA 时区名（如 `Asia/Shanghai`）转换为 MySQL **始终支持**的 UTC 偏移格式
+/// （如 `+08:00`）。MySQL 在 Windows 上默认不加载时区表，`SET time_zone = 'Asia/Shanghai'`
+/// 会报 `Unknown or incorrect time zone`；而偏移格式 `+HH:MM` 无需时区表即可生效。
+///
+/// **安全前提**：偏移量经 `format!` 拼进 `'...'` 字面量。`+HH:MM` / `-HH:MM` 字符集
+/// 为 `[0-9:+-]`，不含单引号/反斜杠/分号，无法突破 `'...'` 字面量边界——无需参数化。
+pub fn set_timezone_sql(tz: chrono_tz::Tz) -> String {
+    let offset = chrono::Utc::now().with_timezone(&tz).offset().fix();
+    format!("SET time_zone = '{}'", offset)
 }
 
 /// 保留期清理 SQL。`?` 绑定保留天数；用 `NOW()`（连接已 SET time_zone）作基准。
@@ -131,7 +134,9 @@ mod tests {
 
     #[test]
     fn sql_builders_format() {
-        assert_eq!(set_timezone_sql("Asia/Shanghai"), "SET time_zone = 'Asia/Shanghai'");
+        // Asia/Shanghai = UTC+8，SET time_zone 应输出偏移格式 '+08:00'。
+        let tz_sql = set_timezone_sql(chrono_tz::Asia::Shanghai);
+        assert!(tz_sql.starts_with("SET time_zone = '+08:00'"), "期望 '+08:00' 偏移格式，实际: {}", tz_sql);
         assert_eq!(retention_delete_sql("gpu_usage"), "DELETE FROM gpu_usage WHERE ts < DATE_SUB(NOW(), INTERVAL ? DAY)");
         // 必须限定 TABLE_SCHEMA，否则跨库同名表会污染列集合。
         let cols_sql = list_columns_sql("t");
