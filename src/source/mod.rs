@@ -67,13 +67,27 @@ impl PrometheusClient {
     /// `metric` 可为完整 PromQL（用于 host_fields 这类算好的单值）或纯指标名
     /// （用于 fields 这类逐卡取值）。返回该查询的所有序列样本。
     ///
+    /// `time` 为 Unix 时间戳(秒)，指定 Prometheus 评估表达式的时刻。
+    /// 传 `None` 时由 Prometheus 使用最新可用数据（默认行为）。
+    /// 传 `Some(ts)` 时在请求中附带 `time` 参数，确保读取固定时刻的数据，
+    /// 避免因采集延迟读到不完整或空数据。
+    ///
     /// 失败（网络错误、非 2xx、3xx 重定向、响应不可解析、响应体超限）统一返回 [`SourceError`]。
-    pub async fn query(&self, metric: &str) -> Result<Vec<MetricSample>, SourceError> {
+    pub async fn query(
+        &self,
+        metric: &str,
+        time: Option<i64>,
+    ) -> Result<Vec<MetricSample>, SourceError> {
         let url = format!("{}/api/v1/query", self.base_url);
+        let form_params: Vec<(&str, String)> = if let Some(ts) = time {
+            vec![("query", metric.to_string()), ("time", ts.to_string())]
+        } else {
+            vec![("query", metric.to_string())]
+        };
         let mut resp = self
             .client
             .post(&url)
-            .form(&[("query", metric)])
+            .form(&form_params)
             .send()
             .await
             .map_err(|e| SourceError(format!("查询 Prometheus 失败: {}", e)))?;

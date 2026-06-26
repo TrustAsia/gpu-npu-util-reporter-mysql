@@ -19,7 +19,11 @@ struct MockQuerier {
 
 #[async_trait]
 impl SourceQuerier for MockQuerier {
-    async fn query(&self, metric: &str) -> Result<Vec<MetricSample>, SourceError> {
+    async fn query(
+        &self,
+        metric: &str,
+        _time: Option<i64>,
+    ) -> Result<Vec<MetricSample>, SourceError> {
         Ok(self.responses.get(metric).cloned().unwrap_or_default())
     }
 }
