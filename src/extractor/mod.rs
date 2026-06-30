@@ -72,20 +72,28 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
     tz: chrono_tz::Tz,
 ) -> Result<Vec<Row>, crate::source::SourceError> {
     // 计算查询时间：2 分钟前 00 秒时刻，避免 Prometheus 采集延迟导致读不到数据。
-    // 例如当前 10:03:25 → 查询时间 10:01:00（Unix 秒级时间戳）。
     let now = Utc::now().with_timezone(&tz);
-    let query_ts = {
-        let two_min_ago = now - chrono::Duration::minutes(2);
-        // 截断到分钟 00 秒：减去秒数
-        two_min_ago
-            .with_second(0)
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(two_min_ago)
-            .timestamp()
-    };
+    let query_ts = compute_query_ts(&now);
+    collect_source_at(cfg, client, tz, Some(query_ts)).await
+}
+
+/// 采集一个 source 的所有行，使用指定的查询时间戳。
+///
+/// 与 [`collect_source`] 相同，但接受显式 `query_ts` 参数，供调度器统一传入
+/// 所有 source 共享的时间戳，确保多源数据时间一致。
+///
+/// `query_ts` 为 `Some(unix_seconds)` 时使用该时间查询 Prometheus；
+/// 为 `None` 时由 Prometheus 使用最新可用数据。
+pub async fn collect_source_at<Q: SourceQuerier + Sync>(
+    cfg: &SourceConfig,
+    client: &Q,
+    tz: chrono_tz::Tz,
+    query_ts: Option<i64>,
+) -> Result<Vec<Row>, crate::source::SourceError> {
+    let now = Utc::now().with_timezone(&tz);
 
     // 1. 主指标 → 行骨架来源（枚举所有卡片序列，决定行数）。
-    let primary_samples = client.query(&cfg.primary.metric, Some(query_ts)).await?;
+    let primary_samples = client.query(&cfg.primary.metric, query_ts).await?;
     let card_label = &cfg.primary.card_label;
 
     // 主指标为空（exporter 宕机/无卡）：提前返回，避免后续无谓的查询。
@@ -101,7 +109,7 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
     let needed_metrics = collect_needed_metrics(cfg);
     let mut metric_cache: HashMap<String, Vec<MetricSample>> = HashMap::new();
     for m in &needed_metrics {
-        let samples = client.query(m, Some(query_ts)).await?;
+        let samples = client.query(m, query_ts).await?;
         metric_cache.insert(m.clone(), samples);
     }
 
@@ -152,7 +160,7 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
     let host_values_by_instance: HashMap<String, HashMap<String, f64>> = if multi_host {
         let mut map: HashMap<String, HashMap<String, f64>> = HashMap::new();
         for hf in &cfg.host_fields {
-            match client.query(&hf.expr, Some(query_ts)).await {
+            match client.query(&hf.expr, query_ts).await {
                 Ok(samples) => {
                     for s in &samples {
                         if !s.value.is_finite() {
@@ -182,7 +190,7 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         // 单主机模式：host_fields 全局一个值，所有卡相同（向后兼容）。
         let mut host_values: HashMap<String, f64> = HashMap::new();
         for hf in &cfg.host_fields {
-            match client.query(&hf.expr, Some(query_ts)).await {
+            match client.query(&hf.expr, query_ts).await {
                 Ok(samples) => {
                     if let Some(first) = samples.first() {
                         if first.value.is_finite() {
@@ -283,61 +291,19 @@ pub async fn collect_source<Q: SourceQuerier + Sync>(
         rows.push(row);
     }
 
-    // 按 (source, ip, card_id) 排序：同一 source 的行连续排列，同一主机的卡有序。
-    // 多主机场景下 Prometheus 返回的样本顺序不确定，不排序会导致数据凌乱。
-    // card_id 数值排序（如 "0","1","10"）比字典序（"0","1","10" 一致但 "2">"10"）
-    // 更符合运维预期——绝大多数 GPU/NPU 卡号为纯数字。
-    // IP 按点分十进制逐段数值排序（如 "192.168.1.2" < "192.168.1.10"），
-    // 避免字典序导致 "192.168.1.10" 排在 "192.168.1.2" 之前。
-    rows.sort_by(|a, b| {
-        match a.source.cmp(&b.source) {
-            std::cmp::Ordering::Equal => match compare_ip(&a.ip, &b.ip) {
-                std::cmp::Ordering::Equal => {
-                    // 优先尝试数值排序（纯数字卡号），回退字典序。
-                    let a_num = a.card_id.parse::<u32>();
-                    let b_num = b.card_id.parse::<u32>();
-                    match (a_num, b_num) {
-                        (Ok(an), Ok(bn)) => an.cmp(&bn),
-                        _ => a.card_id.cmp(&b.card_id),
-                    }
-                }
-                other => other,
-            },
-            other => other,
-        }
-    });
-
+    // 排序由调度层统一完成（所有 source 的行合并后按 source/ip/card_id 排序再写入）。
     Ok(rows)
 }
 
-/// 按点分十进制逐段数值比较两个 IP 地址。
-///
-/// 字典序会导致 "192.168.1.10" 排在 "192.168.1.2" 之前，
-/// 逐段数值比较保证 "192.168.1.2" < "192.168.1.10"。
-/// 非点分格式（如主机名）回退为字典序。
-fn compare_ip(a: &str, b: &str) -> std::cmp::Ordering {
-    let a_parts: Vec<&str> = a.split('.').collect();
-    let b_parts: Vec<&str> = b.split('.').collect();
-    // 若两边都是 4 段纯数字，按段数值比较（IPv4）。
-    if a_parts.len() == 4 && b_parts.len() == 4 {
-        let a_nums: Vec<u64> = match a_parts.iter().map(|s| s.parse::<u64>()).collect() {
-            Ok(v) => v,
-            Err(_) => return a.cmp(b),
-        };
-        let b_nums: Vec<u64> = match b_parts.iter().map(|s| s.parse::<u64>()).collect() {
-            Ok(v) => v,
-            Err(_) => return a.cmp(b),
-        };
-        for (an, bn) in a_nums.iter().zip(b_nums.iter()) {
-            match an.cmp(bn) {
-                std::cmp::Ordering::Equal => continue,
-                other => return other,
-            }
-        }
-        return a_nums.len().cmp(&b_nums.len());
-    }
-    // 非 IPv4 格式（主机名、IPv6 等）回退字典序。
-    a.cmp(b)
+/// 计算查询时间戳：2 分钟前 00 秒时刻，避免 Prometheus 采集延迟导致读不到数据。
+/// 例如当前 10:03:25 → 查询时间 10:01:00（Unix 秒级时间戳）。
+pub fn compute_query_ts(now: &chrono::DateTime<chrono_tz::Tz>) -> i64 {
+    let two_min_ago = *now - chrono::Duration::minutes(2);
+    two_min_ago
+        .with_second(0)
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(two_min_ago)
+        .timestamp()
 }
 
 /// 从 Prometheus `instance` 标签中提取 IP/主机名。
@@ -496,81 +462,21 @@ mod tests {
         assert_eq!(extract_ip_from_instance("::1"), "::1");
     }
 
-    /// 守护：采集行按 (source, ip, card_id) 排序，IP 逐段数值排序，card_id 纯数字时数值排序。
+    /// 守护：compute_query_ts 将当前时间截断到 2 分钟前的整分钟。
     #[test]
-    fn rows_sorted_by_source_then_ip_then_numeric_card_id() {
-        use crate::models::Row;
-        let tz = chrono_tz::Asia::Shanghai;
-        let now = chrono::Utc::now().with_timezone(&tz);
-        let make_row = |ip: &str, card_id: &str, source: &str| Row {
-            ts: now.clone(),
-            ip: ip.into(),
-            card_id: card_id.into(),
-            fields: Default::default(),
-            strings: Default::default(),
-            source: source.into(),
-        };
-        let mut rows = vec![
-            make_row("10.0.0.2", "1", "gpu"),
-            make_row("10.0.0.1", "10", "gpu"),
-            make_row("10.0.0.1", "2", "npu"),
-            make_row("10.0.0.2", "0", "gpu"),
-            make_row("10.0.0.1", "1", "gpu"),
-            make_row("10.0.0.1", "2", "gpu"),
-        ];
-        rows.sort_by(|a, b| {
-            match a.source.cmp(&b.source) {
-                std::cmp::Ordering::Equal => match compare_ip(&a.ip, &b.ip) {
-                    std::cmp::Ordering::Equal => {
-                        let a_num = a.card_id.parse::<u32>();
-                        let b_num = b.card_id.parse::<u32>();
-                        match (a_num, b_num) {
-                            (Ok(an), Ok(bn)) => an.cmp(&bn),
-                            _ => a.card_id.cmp(&b.card_id),
-                        }
-                    }
-                    other => other,
-                },
-                other => other,
-            }
-        });
-        // gpu 在前（字典序 gpu < npu），gpu 内按 IP 逐段数值排序，同 IP 按 card_id 数值排序
-        assert_eq!(rows[0].source, "gpu");
-        assert_eq!(rows[0].ip, "10.0.0.1");
-        assert_eq!(rows[0].card_id, "1");
-        assert_eq!(rows[1].source, "gpu");
-        assert_eq!(rows[1].ip, "10.0.0.1");
-        assert_eq!(rows[1].card_id, "2");
-        assert_eq!(rows[2].source, "gpu");
-        assert_eq!(rows[2].ip, "10.0.0.1");
-        assert_eq!(rows[2].card_id, "10");
-        assert_eq!(rows[3].source, "gpu");
-        assert_eq!(rows[3].ip, "10.0.0.2");
-        assert_eq!(rows[3].card_id, "0");
-        assert_eq!(rows[4].source, "gpu");
-        assert_eq!(rows[4].ip, "10.0.0.2");
-        assert_eq!(rows[4].card_id, "1");
-        // npu 行
-        assert_eq!(rows[5].source, "npu");
-        assert_eq!(rows[5].ip, "10.0.0.1");
-        assert_eq!(rows[5].card_id, "2");
-    }
-
-    /// 守护：compare_ip 逐段数值排序，避免字典序导致 10 < 2。
-    #[test]
-    fn compare_ip_sorts_numerically_per_segment() {
-        use std::cmp::Ordering;
-        // 192.168.1.2 < 192.168.1.10（数值排序）
-        assert_eq!(compare_ip("192.168.1.2", "192.168.1.10"), Ordering::Less);
-        // 192.168.1.10 > 192.168.1.2
-        assert_eq!(compare_ip("192.168.1.10", "192.168.1.2"), Ordering::Greater);
-        // 相等
-        assert_eq!(compare_ip("192.168.1.1", "192.168.1.1"), Ordering::Equal);
-        // 不同段：192.168.2.1 > 192.168.1.10
-        assert_eq!(compare_ip("192.168.2.1", "192.168.1.10"), Ordering::Greater);
-        // 10.0.0.1 < 10.0.0.2
-        assert_eq!(compare_ip("10.0.0.1", "10.0.0.2"), Ordering::Less);
-        // 非 IPv4 格式回退字典序
-        assert_eq!(compare_ip("host-a", "host-b"), Ordering::Less);
+    fn compute_query_ts_truncates_to_minute() {
+        let tz: chrono_tz::Tz = "Asia/Shanghai".parse().unwrap();
+        // 构造一个 10:03:25 的时刻 → query_ts 应为 10:01:00
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()
+            .and_hms_opt(10, 3, 25).unwrap()
+            .and_local_timezone(tz)
+            .unwrap();
+        let ts = compute_query_ts(&now);
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()
+            .and_hms_opt(10, 1, 0).unwrap()
+            .and_local_timezone(tz)
+            .unwrap()
+            .timestamp();
+        assert_eq!(ts, expected);
     }
 }
