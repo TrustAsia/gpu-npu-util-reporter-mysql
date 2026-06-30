@@ -56,7 +56,6 @@ async fn collect_two_cards_with_partial_field() {
         ip_label: "host_ip".into(),
         url: "http://x".into(),
         timeout: 10,
-        interval: None,
         primary: PrimaryConfig {
             metric: "m_primary".into(),
             card_label: "gpu".into(),
@@ -125,7 +124,6 @@ async fn expression_evaluates_per_card() {
         ip_label: "host_ip".into(),
         url: "http://x".into(),
         timeout: 10,
-        interval: None,
         primary: PrimaryConfig {
             metric: "m_primary".into(),
             card_label: "gpu".into(),
@@ -164,7 +162,6 @@ async fn mapping_join_after_collect() {
         ip_label: "host_ip".into(),
         url: "http://x".into(),
         timeout: 10,
-        interval: None,
         primary: PrimaryConfig {
             metric: "m_primary".into(),
             card_label: "gpu".into(),
@@ -233,7 +230,7 @@ async fn mapping_join_after_collect() {
 /// 构造一个 src_key=ip 的资产源，行内按 ip 关联，确认 join_row 用 ip 而非 namespace。
 #[test]
 fn mapping_join_uses_per_source_src_key() {
-    // 行内：ip=10.0.0.1。资产源声明 src_key=ip。
+    // 行内：ip=10.0.0.1（结构性字段，不在 row.strings 中）。资产源声明 src_key=ip。
     let ms = gpu_npu_util_reporter_mysql::config::MappingSource {
         source_path: "tests/fixtures/assets.csv".into(),
         src_key: "ip".into(), // 故意用 ip 而非 namespace，验证按源取键
@@ -253,7 +250,8 @@ fn mapping_join_uses_per_source_src_key() {
     let index = vec![gpu_npu_util_reporter_mysql::mapping::load_source(&ms).unwrap()];
     let msrcs = vec![ms];
 
-    // 行内同时有 namespace(default) 和 ip；但本源 src_key=ip，故应按 ip 关联。
+    // ip 是结构性字段（row.ip），不在 row.strings 中。
+    // join_row 须从 row.ip 取值而非 row.strings，否则 key 为空串 → 静默全 NULL。
     // assets.csv 的 dest_key 是 Namespace 列，值不可能是 IP → 必然无匹配 → NULL。
     let mut row = gpu_npu_util_reporter_mysql::models::Row {
         ts: chrono::Utc::now().with_timezone(&chrono_tz::Asia::Shanghai),
@@ -262,7 +260,6 @@ fn mapping_join_uses_per_source_src_key() {
         fields: Default::default(),
         strings: HashMap::from([
             ("namespace".into(), Some("default".into())),
-            ("ip".into(), Some("10.0.0.1".into())),
         ]),
         source: "s1".into(),
     };

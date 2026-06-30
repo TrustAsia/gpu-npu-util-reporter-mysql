@@ -6,7 +6,8 @@
 # 首次使用：复制为 config.yaml 并按实际环境修改。
 # =====================================================================
 
-# 全局默认采集间隔(秒)。必填。每个 source 可用自身 interval 覆盖。
+# 全局采集间隔(秒)。必填。所有 source 共享同一间隔（统一采集循环下各源行需合并
+# 排序后统一写入，共享 query_ts），不再支持 per-source 间隔覆盖。
 # 取值范围: 正整数。建议 >=15，过小会压垮 Prometheus。
 interval: 60
 
@@ -48,7 +49,7 @@ logging:
   dir: "./logs"              # 日志目录(自动创建)，归档包也存于此
   all_file: "all.log"        # 完整日志前缀(实际: all-2026-06-24.log)
   error_file: "error.log"    # 错误日志前缀(实际: error-2026-06-24.log)
-  rotation: "daily"          # daily/hourly/never
+  rotation: "daily"          # 当前仅支持 daily（hourly/never 暂未实现）
   archive_after_days: 7      # 散日志保留天数(必须 >0)；超期后打包归档
   archive_prefix: "logs"     # 归档包前缀(logs-2026-06-24.tar.gz)
   stdout: true               # 是否同时输出 stdout(容器场景建议 true)
@@ -94,7 +95,6 @@ sources:
     ip: "10.0.0.1"                     # 单主机模式：固定 IP
     url: "http://10.0.0.1:9400"        # 该主机自己的 Prometheus
     timeout: 10                        # 查询超时(秒)，默认10
-    interval: 30                       # 覆盖全局 interval
     primary:                           # 主指标：枚举所有卡片，决定行数
       metric: "DCGM_FI_DEV_GPU_UTIL"
       card_label: "gpu"                # dcgm 用 gpu 标签作卡号

@@ -198,6 +198,20 @@ fn is_numeric_type(col_type: &str) -> bool {
         || lower.starts_with("decimal")
 }
 
+/// 从采集行中解析关联键值。
+///
+/// `src_key` 可能指向行内的结构性字段（ip/card_id/source，存在 Row 的具名字段中）
+/// 或标签字段（namespace/pod 等，存在 `row.strings` 中）。本函数统一处理两种情况，
+/// 避免 `src_key: "ip"` 时因只查 `row.strings` 而得到 None → 关联键空串 → 全列静默 NULL。
+fn resolve_row_key(row: &CollectorRow, src_key: &str) -> Option<String> {
+    match src_key {
+        "ip" => Some(row.ip.clone()),
+        "card_id" => Some(row.card_id.clone()),
+        "source" => Some(row.source.clone()),
+        _ => row.strings.get(src_key).cloned().flatten(),
+    }
+}
+
 /// 把一个采集行与所有资产索引 join，补 mapping 列到 `row.strings`。
 ///
 /// 每个资产索引用其对应 `mapping_sources[idx].src_key` 作为行内关联键
@@ -215,15 +229,12 @@ pub fn join_row(
 
     for (idx, index) in indices.iter().enumerate() {
         // 每个资产源用自己的 src_key 从行内取关联值。
+        // src_key 可能指向结构性字段（ip/card_id/source）或 strings 中的标签字段。
         let src_key = mapping_sources
             .get(idx)
             .map(|ms| ms.src_key.as_str())
             .unwrap_or("");
-        let key_value = row
-            .strings
-            .get(src_key)
-            .cloned()
-            .flatten()
+        let key_value = resolve_row_key(row, src_key)
             .map(|v| normalize_key(&v))
             .unwrap_or_default();
         let matched = index.lookup(&key_value);
@@ -417,5 +428,27 @@ mod tests {
         assert!(!is_numeric_type("varchar(255)"));
         assert!(!is_numeric_type("text"));
         assert!(!is_numeric_type("datetime"));
+    }
+
+    /// 守护：resolve_row_key 须从结构性字段取值（ip/card_id/source），
+    /// 也能从 strings 取标签字段（namespace）。这是 src_key: "ip" 不静默 NULL 的关键。
+    #[test]
+    fn resolve_row_key_finds_structural_fields() {
+        let row = CollectorRow {
+            ts: chrono::Utc::now().with_timezone(&chrono_tz::Asia::Shanghai),
+            ip: "10.0.0.1".into(),
+            card_id: "3".into(),
+            fields: Default::default(),
+            strings: HashMap::from([("namespace".into(), Some("default".into()))]),
+            source: "gpu".into(),
+        };
+        // 结构性字段
+        assert_eq!(resolve_row_key(&row, "ip"), Some("10.0.0.1".into()));
+        assert_eq!(resolve_row_key(&row, "card_id"), Some("3".into()));
+        assert_eq!(resolve_row_key(&row, "source"), Some("gpu".into()));
+        // strings 中的标签字段
+        assert_eq!(resolve_row_key(&row, "namespace"), Some("default".into()));
+        // 不存在的 key → None
+        assert_eq!(resolve_row_key(&row, "nonexistent"), None);
     }
 }

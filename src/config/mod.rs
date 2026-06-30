@@ -25,7 +25,8 @@ use std::path::Path;
 /// 对应整个 YAML 文件。包含全局参数、数据库、日志、资产表 mapping、数据源列表。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// 全局默认采集间隔(秒)。每个 source 可用自身 interval 覆盖。
+    /// 全局采集间隔(秒)。所有 source 共享同一间隔，统一采集循环下 per-source 间隔
+    /// 无法适用（各源行需合并排序后统一写入，共享 query_ts）。
     pub interval: u64,
     /// 数据保留期(天)。retention 任务据此定期删除早于该天数的旧行。
     pub retention_days: u32,
@@ -83,7 +84,7 @@ pub struct LoggingConfig {
     pub all_file: String,
     /// 错误日志前缀。
     pub error_file: String,
-    /// 轮转粒度: daily/hourly/never。
+    /// 轮转粒度: 当前仅支持 daily（hourly/never 暂未实现，配置后启动报错）。
     pub rotation: String,
     /// 散日志保留天数；超期后打包归档。
     pub archive_after_days: u32,
@@ -174,8 +175,6 @@ pub struct SourceConfig {
     /// 查询超时(秒)，默认 10。
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    /// 覆盖全局 interval；None 时用全局 interval。
-    pub interval: Option<u64>,
     pub primary: PrimaryConfig,
     #[serde(default)]
     pub fields: Vec<FieldConfig>,
@@ -380,14 +379,6 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
     for (i, src) in cfg.sources.iter().enumerate() {
-        if let Some(iv) = src.interval {
-            if iv == 0 {
-                return Err(ConfigError(format!(
-                    "sources[{}]({}).interval 必须 > 0",
-                    i, src.name
-                )));
-            }
-        }
         // timeout=0 会让该源每次查询立即超时 → 该源每轮都失败、永远采不到数据。
         // 有 serde 默认值 10 兜底，显式写 0 几乎必为笔误，在此早期拦截。
         if src.timeout == 0 {
@@ -460,11 +451,11 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             cfg.logging.level
         )));
     }
-    // rotation 字段当前实现固定按日切分（见 main::daily_log_path），值仅作文档约束，
-    // 但仍校验合法枚举，避免用户误以为支持 hourly/never 而配置后无效果。
-    if !matches!(cfg.logging.rotation.as_str(), "daily" | "hourly" | "never") {
+    // rotation 字段当前实现固定按日切分（见 main::daily_log_path），暂不支持 hourly/never。
+    // 在此仅允许 daily，避免用户误以为支持其它值而配置后无效果。
+    if cfg.logging.rotation != "daily" {
         return Err(ConfigError(format!(
-            "logging.rotation '{}' 非法，须为 daily/hourly/never",
+            "logging.rotation '{}' 非法，当前仅支持 daily（hourly/never 暂未实现）",
             cfg.logging.rotation
         )));
     }
@@ -843,28 +834,6 @@ sources:
     }
 
     #[test]
-    fn rejects_zero_source_interval() {
-        // 给 source 加一个 interval: 0，应被拒绝。
-        let yaml = valid_base_yaml().replace(
-            "primary: { metric: \"m1\", card_label: \"gpu\" }",
-            "interval: 0\n    primary: { metric: \"m1\", card_label: \"gpu\" }",
-        );
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert!(validate(&cfg).is_err());
-    }
-
-    #[test]
-    fn accepts_positive_source_interval() {
-        // source 自身正数 interval 应通过。
-        let yaml = valid_base_yaml().replace(
-            "primary: { metric: \"m1\", card_label: \"gpu\" }",
-            "interval: 30\n    primary: { metric: \"m1\", card_label: \"gpu\" }",
-        );
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert!(validate(&cfg).is_ok());
-    }
-
-    #[test]
     fn rejects_empty_sources() {
         // 删掉 sources 段后整体替换为空列表
         let yaml = valid_base_yaml().split("sources:").next().unwrap().to_string()
@@ -995,12 +964,14 @@ sources:
         assert!(validate(&cfg).is_err());
     }
 
-    /// 守护：logging.rotation 枚举校验（虽当前实现固定 daily，仍拒绝非法值）。
+    /// 守护：logging.rotation 当前仅支持 daily；hourly/never 暂未实现，应拒绝。
     #[test]
     fn rejects_bad_logging_rotation() {
-        let yaml = valid_base_yaml().replace("rotation: \"daily\"", "rotation: \"weekly\"");
-        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert!(validate(&cfg).is_err());
+        for bad in &["weekly", "hourly", "never"] {
+            let yaml = valid_base_yaml().replace("rotation: \"daily\"", &format!("rotation: \"{}\"", bad));
+            let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert!(validate(&cfg).is_err(), "rotation={} 应被拒绝", bad);
+        }
     }
 
     /// 守护：on_extra_columns 枚举校验。非法值不应走默认 continue 分支。

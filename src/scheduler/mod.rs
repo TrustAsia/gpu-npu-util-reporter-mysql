@@ -21,8 +21,7 @@
 //!
 //! ## 可测试性
 //! 调度本身涉及 spawn + sleep + tokio 运行时，难以单元测试；
-//! 但采集间隔的选择逻辑 [`effective_interval`] 与对齐计算 [`next_aligned_time`]
-//! 是纯函数，单独覆盖。
+//! 但对齐计算 [`next_aligned_time`] 是纯函数，单独覆盖。
 
 use crate::extractor::{collect_source_at, SourceQuerier};
 use crate::mapping::{join_row, AssetIndex};
@@ -30,13 +29,6 @@ use crate::sink::Sink;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
-
-/// 计算某 source 的实际采集间隔：source 自身 interval 优先，缺省取全局 interval。
-///
-/// 抽成纯函数便于单测（避免为测试构造完整 `Config`）。
-pub fn effective_interval(src_interval: Option<u64>, global_interval: u64) -> u64 {
-    src_interval.unwrap_or(global_interval)
-}
 
 /// 计算下一个对齐到 `interval` 整数倍的时间点。
 ///
@@ -323,16 +315,6 @@ async fn sleep_or_shutdown(secs: u64, shutdown: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prefers_source_interval_when_set() {
-        assert_eq!(effective_interval(Some(30), 60), 30);
-    }
-
-    #[test]
-    fn falls_back_to_global_when_source_unset() {
-        assert_eq!(effective_interval(None, 60), 60);
-    }
 
     // —— next_aligned_time 测试 ——
 
