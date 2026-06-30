@@ -89,7 +89,7 @@ pub async fn collect_source_at<Q: SourceQuerier + Sync>(
     client: &Q,
     tz: chrono_tz::Tz,
     query_ts: Option<i64>,
-92) -> Result<Vec<Row>, crate::source::SourceError> {
+) -> Result<Vec<Row>, crate::source::SourceError> {
     // 行的 ts 应表达"数据代表哪个时刻"而非"程序何时采集"。
     // 当 query_ts 有值时（调度器统一传入），用 query_ts 对应的时刻；
     // 无值时退化为当前时刻（兼容直接调用 collect_source 的场景）。
